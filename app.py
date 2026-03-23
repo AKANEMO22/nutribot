@@ -1,15 +1,36 @@
 from pathlib import Path
 import re
+import os
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 BASE_DIR = Path(__file__).resolve().parent
-FPT_BUILD_DIR = BASE_DIR.parent / "FPT University Portal Redesign" / "build"
 
 
-def build_inline_react_html() -> str:
-    index_html_path = FPT_BUILD_DIR / "index.html"
+def resolve_build_dir() -> Path | None:
+    """Find a React build directory from common locations."""
+    env_build_dir = os.getenv("FPT_BUILD_DIR")
+    candidates = []
+    if env_build_dir:
+        candidates.append(Path(env_build_dir))
+
+    candidates.extend(
+        [
+            BASE_DIR / "build",
+            BASE_DIR / "frontend" / "build",
+            BASE_DIR.parent / "FPT University Portal Redesign" / "build",
+        ]
+    )
+
+    for candidate in candidates:
+        if (candidate / "index.html").exists():
+            return candidate
+    return None
+
+
+def build_inline_react_html(build_dir: Path) -> str:
+    index_html_path = build_dir / "index.html"
     if not index_html_path.exists():
         return ""
 
@@ -20,8 +41,8 @@ def build_inline_react_html() -> str:
     if not css_match or not js_match:
         return ""
 
-    css_path = FPT_BUILD_DIR / css_match.group(1).lstrip("/")
-    js_path = FPT_BUILD_DIR / js_match.group(1).lstrip("/")
+    css_path = build_dir / css_match.group(1).lstrip("/")
+    js_path = build_dir / js_match.group(1).lstrip("/")
     if not css_path.exists() or not js_path.exists():
         return ""
 
@@ -49,7 +70,8 @@ def build_inline_react_html() -> str:
 
 
 st.set_page_config(page_title="Nutrious Consultant", layout="wide")
-inline_html = build_inline_react_html()
+build_dir = resolve_build_dir()
+inline_html = build_inline_react_html(build_dir) if build_dir else ""
 
 st.markdown(
     """
@@ -72,7 +94,19 @@ st.markdown(
 )
 
 if inline_html:
-    st.info("Dang nhung truc tiep ban build React tu FPT University Portal Redesign vao Streamlit.")
+    st.info(f"Dang nhung truc tiep ban build React tu: {build_dir}")
     components.html(inline_html, height=1200, scrolling=True)
 else:
-    st.error("Khong tim thay ban build FPT. Hay chay npm run build trong folder FPT University Portal Redesign.")
+    st.warning("Chua tim thay ban build React. App van chay, nhung se hien che do huong dan.")
+    st.markdown(
+        """
+### Huong dan khoi phuc giao dien FPT
+1. Mo project frontend React cua ban.
+2. Chay lenh `npm run build`.
+3. Dat thu muc `build` vao mot trong cac vi tri sau:
+   - `nutribot/build`
+   - `nutribot/frontend/build`
+   - `../FPT University Portal Redesign/build`
+4. Hoac dat bien moi truong `FPT_BUILD_DIR` tro den thu muc build.
+        """
+    )
