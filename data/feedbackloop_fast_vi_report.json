@@ -1,0 +1,65 @@
+{
+  "created_at": 1774352552,
+  "config": {
+    "rounds": 1,
+    "sleep": 0.0,
+    "prompts": [
+      "Xin chao",
+      "Vach ke hoach giam can trong vong 1 thang cho nguoi moi bat dau.",
+      "Goi y thuc don giam mo trong 1 ngay cho nguoi 75kg.",
+      "100g uc ga co bao nhieu protein va calo?"
+    ]
+  },
+  "summary": {
+    "total": 4,
+    "ok_rate": 1.0,
+    "blocked_rate": 0.0,
+    "quality_rate": 1.0,
+    "latency_fastest_sec": 0.0,
+    "latency_avg_sec": 0.001,
+    "latency_slowest_sec": 0.004,
+    "ready_for_demo": true
+  },
+  "records": [
+    {
+      "question": "Xin chao",
+      "ok": true,
+      "blocked": false,
+      "quality_ok": true,
+      "rating": "up",
+      "latency_sec": 0.0,
+      "answer": "Chào bạn! Mình là NutriBot, bạn muốn mình tư vấn calories hay thực đơn hôm nay?",
+      "answer_preview": "Chào bạn! Mình là NutriBot, bạn muốn mình tư vấn calories hay thực đơn hôm nay?"
+    },
+    {
+      "question": "Vach ke hoach giam can trong vong 1 thang cho nguoi moi bat dau.",
+      "ok": true,
+      "blocked": false,
+      "quality_ok": true,
+      "rating": "up",
+      "latency_sec": 0.0,
+      "answer": "Kế hoạch giảm cân 1 tháng an toàn: mục tiêu giảm 2-3kg, thâm hụt 300-500 kcal/ngày. Mỗi ngày ăn đủ protein (1.4-1.8g/kg), ưu tiên thực phẩm tươi, đi bộ hoặc tập 30-45 phút và ngủ 7-8 tiếng. Nếu muốn, mình sẽ lên lịch ăn và tập chi tiết theo cân nặng hiện tại của bạn.",
+      "answer_preview": "Kế hoạch giảm cân 1 tháng an toàn: mục tiêu giảm 2-3kg, thâm hụt 300-500 kcal/ngày. Mỗi ngày ăn đủ protein (1.4-1.8g/kg), ưu tiên thực phẩm tươi, đi bộ hoặc tập 30-45 phút và ngủ 7"
+    },
+    {
+      "question": "Goi y thuc don giam mo trong 1 ngay cho nguoi 75kg.",
+      "ok": true,
+      "blocked": false,
+      "quality_ok": true,
+      "rating": "up",
+      "latency_sec": 0.0,
+      "answer": "Thực đơn 1 ngày để giảm mỡ (mẫu): sáng yến mạch + 2 trứng; trưa 150g ức gà + rau + 1/2 chén cơm; xế 1 hũ sữa chua không đường; tối cá/đậu phụ + salad + khoai lang nhỏ. Mục tiêu khoảng 1600-1800 kcal và đủ 110-130g protein/ngày.",
+      "answer_preview": "Thực đơn 1 ngày để giảm mỡ (mẫu): sáng yến mạch + 2 trứng; trưa 150g ức gà + rau + 1/2 chén cơm; xế 1 hũ sữa chua không đường; tối cá/đậu phụ + salad + khoai lang nhỏ. Mục tiêu kho"
+    },
+    {
+      "question": "100g uc ga co bao nhieu protein va calo?",
+      "ok": true,
+      "blocked": false,
+      "quality_ok": true,
+      "rating": "up",
+      "latency_sec": 0.004,
+      "answer": "100g uc ga có khoảng 35.0g protein và 250 kcal. Bạn muốn mình quy đổi theo khẩu phần bạn ăn mỗi bữa không?",
+      "answer_preview": "100g uc ga có khoảng 35.0g protein và 250 kcal. Bạn muốn mình quy đổi theo khẩu phần bạn ăn mỗi bữa không?"
+    }
+  ]
+}

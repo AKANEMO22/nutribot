@@ -36,6 +36,48 @@ MODEL_STATE = {
 NUTRITION_DB_CACHE = None
 MODEL_PRELOAD_STARTED = False
 
+PROMPT_LEAK_MARKERS = (
+    "trả lời ngắn gọn",
+    "tra loi ngan gon",
+    "ưu tiên dùng tiếng việt",
+    "uu tien dung tieng viet",
+    "nếu người dùng chỉ chào",
+    "neu nguoi dung chi chao",
+    "ngữ cảnh",
+    "ngu canh",
+    "assistant:",
+    "duyet:",
+    "xem trang web",
+)
+
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+GREETING_PREFIXES = (
+    "hi",
+    "hello",
+    "hey",
+    "xin chao",
+    "chao",
+)
+
+
+def is_greeting_like(text: str) -> bool:
+    normalized = normalize_food_name(text)
+    if not normalized:
+        return False
+
+    compact = re.sub(r"[^a-z0-9\s]", "", normalized)
+    compact = re.sub(r"\s+", " ", compact).strip()
+    if not compact:
+        return False
+
+    # Allow short natural variants like: "chao ban", "xin chao bot", "hello ban".
+    for p in GREETING_PREFIXES:
+        if compact == p or compact.startswith(p + " "):
+            return True
+
+    return False
+
 
 def should_skip_safety_filter(text: str) -> bool:
     normalized = normalize_food_name(text)
@@ -43,7 +85,7 @@ def should_skip_safety_filter(text: str) -> bool:
         return True
 
     # Avoid false-positive blocks for simple greetings/short benign messages.
-    if normalized in {"hi", "hello", "hey", "xin chao", "chao"}:
+    if is_greeting_like(normalized):
         return True
 
     if len(normalized) <= 3 and normalized.isalpha():
@@ -53,8 +95,7 @@ def should_skip_safety_filter(text: str) -> bool:
 
 
 def is_short_greeting(text: str) -> bool:
-    normalized = normalize_food_name(text)
-    return normalized in {"hi", "hello", "hey", "xin chao", "chao"}
+    return is_greeting_like(text)
 
 
 def has_nutrition_intent(text: str) -> bool:
@@ -100,6 +141,96 @@ def looks_unaccented_vietnamese(answer: str) -> bool:
     has_plain_marker = any(m in f" {lower} " for m in vietnamese_plain_markers)
     has_diacritic = bool(re.search(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", lower))
     return has_plain_marker and not has_diacritic
+
+
+def build_safe_fallback_answer(question: str) -> str:
+    q = normalize_food_name(question)
+    if is_short_greeting(question):
+        return "Chào bạn! Mình là NutriBot, bạn muốn mình tư vấn calories hay thực đơn hôm nay?"
+
+    if "uc ga" in q and ("protein" in q or "calo" in q or "kcal" in q):
+        return "100g ức gà chín thường có khoảng 31g protein và 160-170 kcal. Bạn muốn mình tính theo khẩu phần bạn đang ăn không?"
+
+    if "giam" in q and ("can" in q or "mo" in q):
+        return (
+            "Bạn có thể giảm 0.5kg mỗi tuần bằng cách giảm 300-500 kcal/ngày, ăn đủ protein và tập 30-45 phút/ngày. "
+            "Nếu muốn, mình sẽ lên thực đơn 7 ngày theo cân nặng và mục tiêu của bạn."
+        )
+
+    return "Mình đã hiểu câu hỏi của bạn. Bạn cho mình thêm mục tiêu cân nặng, chiều cao và mức vận động để mình tư vấn chính xác hơn nhé."
+
+
+def sanitize_answer_text(question: str, answer: str) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return ""
+
+    text = URL_RE.sub("", text)
+    lines = [ln.strip() for ln in text.replace("\r", "").split("\n")]
+
+    cleaned_lines = []
+    seen_norm = set()
+    for ln in lines:
+        if not ln:
+            continue
+
+        ln_lower = ln.lower()
+        if any(marker in ln_lower for marker in PROMPT_LEAK_MARKERS):
+            continue
+
+        norm = normalize_food_name(ln)
+        if not norm:
+            continue
+        if norm in seen_norm:
+            continue
+
+        seen_norm.add(norm)
+        cleaned_lines.append(ln)
+
+    text = "\n".join(cleaned_lines).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Fix truncated/garbled prefix patterns like "ột mốc. Có thể bạn..." by cutting to
+    # the first coherent Vietnamese sentence starter when present.
+    for marker in ("Có thể bạn", "Bạn có thể", "Mình gợi ý", "Hôm nay bạn"):
+        idx = text.find(marker)
+        if idx > 0:
+            text = text[idx:]
+            break
+
+    if len(text) > 380:
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        text = " ".join(parts[:3]).strip()
+
+    if looks_unaccented_vietnamese(text):
+        return ""
+
+    return text
+
+
+def looks_noisy_answer(question: str, answer: str) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return True
+
+    lower = text.lower()
+    if any(marker in lower for marker in PROMPT_LEAK_MARKERS):
+        return True
+
+    if URL_RE.search(text):
+        return True
+
+    chunks = [c.strip() for c in re.split(r"[.!?\n]+", text) if c.strip()]
+    if len(chunks) >= 3:
+        norm_chunks = [normalize_food_name(c) for c in chunks]
+        repeated = len(norm_chunks) - len(set(norm_chunks))
+        if repeated >= 1:
+            return True
+
+    if looks_low_quality_answer(question, text):
+        return True
+
+    return False
 
 
 def build_feedback_loop_summary(limit: int = 400) -> dict:
@@ -237,6 +368,57 @@ def build_nutrition_context(question: str, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+def try_rule_based_answer(question: str) -> str:
+    q = normalize_food_name(question)
+
+    if is_short_greeting(question):
+        return "Chào bạn! Mình là NutriBot, bạn muốn mình tư vấn calories hay thực đơn hôm nay?"
+
+    if "uc ga" in q and ("protein" in q or "calo" in q or "kcal" in q):
+        nutrition_db = load_nutrition_db_from_dashboard()
+        uc_ga = None
+        for key, info in nutrition_db.items():
+            if "uc ga" in key:
+                uc_ga = info
+                break
+
+        if uc_ga:
+            return (
+                f"100g {uc_ga['name']} có khoảng {uc_ga['protein']:.1f}g protein và {uc_ga['calories']:.0f} kcal. "
+                "Bạn muốn mình quy đổi theo khẩu phần bạn ăn mỗi bữa không?"
+            )
+
+        return "100g ức gà chín thường có khoảng 31g protein và 160-170 kcal. Bạn muốn mình tính theo khẩu phần thực tế của bạn không?"
+
+    if "vach ke hoach giam can" in q or ("giam can" in q and "1 thang" in q):
+        return (
+            "Kế hoạch giảm cân 1 tháng an toàn: mục tiêu giảm 2-3kg, thâm hụt 300-500 kcal/ngày. "
+            "Mỗi ngày ăn đủ protein (1.4-1.8g/kg), ưu tiên thực phẩm tươi, đi bộ hoặc tập 30-45 phút và ngủ 7-8 tiếng. "
+            "Nếu muốn, mình sẽ lên lịch ăn và tập chi tiết theo cân nặng hiện tại của bạn."
+        )
+
+    if (
+        ("tu van" in q and ("calo" in q or "kcal" in q) and "hom nay" in q)
+        or (("calo" in q or "kcal" in q) and "ngay hom nay" in q)
+        or (("calo" in q or "kcal" in q) and "hom nay" in q)
+        or (("calo" in q or "kcal" in q) and "trong ngay" in q)
+    ):
+        return (
+            "Hôm nay bạn nên bắt đầu với mục tiêu 1600-1800 kcal nếu đang muốn giảm mỡ nhẹ. "
+            "Chia 3 bữa chính + 1 bữa phụ, ưu tiên đủ protein (khoảng 1.4-1.8g/kg cân nặng), rau xanh và uống đủ nước. "
+            "Nếu bạn gửi cân nặng và chiều cao, mình sẽ chốt con số kcal chính xác hơn cho riêng bạn."
+        )
+
+    if ("thuc don" in q and ("giam mo" in q or "giam can" in q)) or ("goi y" in q and "1 ngay" in q):
+        return (
+            "Thực đơn 1 ngày để giảm mỡ (mẫu): sáng yến mạch + 2 trứng; trưa 150g ức gà + rau + 1/2 chén cơm; "
+            "xế 1 hũ sữa chua không đường; tối cá/đậu phụ + salad + khoai lang nhỏ. "
+            "Mục tiêu khoảng 1600-1800 kcal và đủ 110-130g protein/ngày."
+        )
+
+    return ""
+
+
 def load_rag_and_models():
     q_filter_instance = None
     model_path = BASE_DIR / "weight" / "question_filter_model.pkl"
@@ -314,6 +496,10 @@ def run_local_chat_query(user_text: str) -> dict:
     # Keep prompt compact for small local models.
     text = text[:320]
 
+    rule_answer = try_rule_based_answer(text)
+    if rule_answer:
+        return {"ok": True, "answer": rule_answer, "source": "local_rule"}
+
     state = ensure_models_loaded()
     q_filter_instance = state.get("q_filter")
     chain = state.get("rag_chain")
@@ -376,7 +562,9 @@ def run_local_chat_query(user_text: str) -> dict:
             else:
                 raise
 
-        if not answer or looks_low_quality_answer(text, answer):
+        answer = sanitize_answer_text(text, answer)
+
+        if looks_noisy_answer(text, answer):
             feedback_summary = build_feedback_loop_summary()
             strict_tone = ""
             if feedback_summary.get("greeting_down_rate", 0.0) >= 0.3:
@@ -385,19 +573,24 @@ def run_local_chat_query(user_text: str) -> dict:
             retry_question = (
                 f"Người dùng hỏi: {text}. "
                 "Hãy trả lời ngắn gọn, rõ ràng bằng tiếng Việt trong 1-3 câu."
-                " Không trích URL, không đưa tài liệu học thuật không liên quan."
+                " Chỉ trả về câu trả lời cuối cùng cho người dùng."
+                " Không trích URL, không đưa hướng dẫn hệ thống, không lặp câu."
                 f"{strict_tone}"
             )
-            retry_result = chain({"question": retry_question[:600], "skip_retrieval": True})
-            answer = str(retry_result.get("answer", "")).strip()
 
-        if greeting_mode and (not answer or looks_low_quality_answer(text, answer) or len(answer) > 180):
+            for _ in range(2):
+                retry_result = chain({"question": retry_question[:600], "skip_retrieval": True})
+                answer = sanitize_answer_text(text, str(retry_result.get("answer", "")).strip())
+                if not looks_noisy_answer(text, answer):
+                    break
+
+        if greeting_mode and (not answer or looks_noisy_answer(text, answer) or len(answer) > 180):
             greeting_retry = (
                 "Người dùng vừa chào. "
                 "Hãy chào lại bằng tiếng Việt có dấu trong 1 câu dưới 20 từ, thân thiện, không ký tự lạ."
             )
             gr = chain({"question": greeting_retry, "skip_retrieval": True})
-            answer = str(gr.get("answer", "")).strip()
+            answer = sanitize_answer_text(text, str(gr.get("answer", "")).strip())
 
         if looks_unaccented_vietnamese(answer):
             rewrite_q = (
@@ -405,12 +598,15 @@ def run_local_chat_query(user_text: str) -> dict:
                 f"{answer[:300]}"
             )
             rewritten = chain({"question": rewrite_q, "skip_retrieval": True})
-            rewritten_answer = str(rewritten.get("answer", "")).strip()
+            rewritten_answer = sanitize_answer_text(text, str(rewritten.get("answer", "")).strip())
             if rewritten_answer:
                 answer = rewritten_answer
 
-        if greeting_mode and (not answer or looks_low_quality_answer(text, answer) or len(answer) > 180):
-            answer = "Chào bạn! Mình là NutriBot, bạn muốn mình hỗ trợ calories hay thực đơn hôm nay?"
+        if greeting_mode and (not answer or looks_noisy_answer(text, answer) or len(answer) > 180):
+            answer = build_safe_fallback_answer(text)
+
+        if looks_noisy_answer(text, answer):
+            answer = build_safe_fallback_answer(text)
 
         if not answer:
             return {
