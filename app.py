@@ -51,6 +51,13 @@ PROMPT_LEAK_MARKERS = (
     "meta-instruction",
     "cau hoi:",
     "tra loi:",
+    "assistant:",
+    "user:",
+    "system:",
+    "khong su dung meta-instruction",
+    "không sử dụng meta-instruction",
+    "tra loi dai hon",
+    "trả lời dài hơn",
 )
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -195,6 +202,10 @@ def sanitize_answer_text(question: str, answer: str) -> str:
     text = re.sub(r"\bNguoi dung:\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bNgười dùng:\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bAI:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bAssistant:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bUser:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bSystem:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^[A-Za-zÀ-ỹ]{1,3},\s+", "", text)
 
     # Keep only the final answer section if model echoes instruction wrappers.
     for marker in ("Câu trả lời cuối cùng:", "Cau tra loi cuoi cung:"):
@@ -518,6 +529,13 @@ def run_local_chat_query(user_text: str) -> dict:
         nutrition_context = build_nutrition_context(text, limit=4) if has_nutrition_intent(text) else ""
         use_retrieval = bool(nutrition_context)
 
+        def call_chain_safe(payload_question: str, skip_retrieval: bool):
+            try:
+                res = chain({"question": payload_question, "skip_retrieval": skip_retrieval})
+                return str(res.get("answer", "")).strip()
+            except Exception:
+                return ""
+
         if use_retrieval and nutrition_context:
             final_question = (
                 f"{text}\n\n"
@@ -528,66 +546,40 @@ def run_local_chat_query(user_text: str) -> dict:
             final_question = text
         else:
             final_question = (
-                "Đây là tin nhắn mới nhất của người dùng trong cuộc hội thoại. "
-                "Nếu đây là thông tin bổ sung (ví dụ cân nặng/chiều cao), hãy nối tiếp theo ngữ cảnh trước đó. "
-                "Nếu tin nhắn chủ yếu là số đo cơ thể, hãy ước tính BMI sơ bộ và gợi ý mức kcal/ngày phù hợp. "
-                "Trả lời bằng tiếng Việt tự nhiên, ngắn gọn, không lặp, không URL, không meta-instruction. "
-                f"Tin nhắn người dùng: {text}"
+                f"Câu hỏi người dùng: {text}\n"
+                "Trả lời bằng tiếng Việt tự nhiên trong 2-4 câu. "
+                "Nếu đây là số đo cơ thể thì ước tính BMI và gợi ý mức kcal/ngày phù hợp. "
+                "Nếu thiếu dữ liệu thì hỏi thêm thông tin cần thiết."
             )
 
         final_question = final_question[:1200]
 
-        def call_chain(payload_question: str, skip_retrieval: bool):
-            return chain({"question": payload_question, "skip_retrieval": skip_retrieval})
+        answer = call_chain_safe(final_question, (not use_retrieval))
+        last_raw_answer = answer
 
-        try:
-            result = call_chain(final_question, (not use_retrieval))
-            answer = str(result.get("answer", "")).strip()
-            last_raw_answer = answer
-        except Exception as first_exc:
-            msg = str(first_exc).lower()
-            if ("max_length" in msg) or ("input length" in msg) or ("indexing errors" in msg):
-                compact_question = (
-                    f"Tra loi bang tieng Viet, toi da 2 cau, khong URL. Cau hoi: {text}"
-                )[:260]
-                result = call_chain(compact_question, True)
-                answer = str(result.get("answer", "")).strip()
-                last_raw_answer = answer
-            else:
-                raise
+        if not answer:
+            compact_question = (
+                f"Tra loi bang tieng Viet, toi da 3 cau. Cau hoi: {text}"
+            )[:260]
+            answer = call_chain_safe(compact_question, True)
+            last_raw_answer = answer or last_raw_answer
 
         answer = sanitize_answer_text(text, answer)
 
         if looks_noisy_answer(text, answer):
-            feedback_summary = build_feedback_loop_summary()
-            strict_tone = ""
-            if feedback_summary.get("greeting_down_rate", 0.0) >= 0.3:
-                strict_tone = " Tra loi rat ngan gon (toi da 2 cau)."
-
             retry_question = (
-                f"Người dùng hỏi: {text}. "
-                "Hãy trả lời ngắn gọn, rõ ràng bằng tiếng Việt trong 1-3 câu."
-                " Chỉ trả về câu trả lời cuối cùng cho người dùng."
-                " Không trích URL, không đưa hướng dẫn hệ thống, không lặp câu."
-                " Không bịa hội thoại hoặc lịch sử người dùng nếu không có dữ liệu."
-                f"{strict_tone}"
+                f"Viết lại câu trả lời cho câu hỏi sau bằng tiếng Việt rõ ràng, không lặp: {text}"
             )
-
-            for _ in range(1):
-                retry_result = chain({"question": retry_question[:600], "skip_retrieval": True})
-                raw_retry = str(retry_result.get("answer", "")).strip()
-                last_raw_answer = raw_retry or last_raw_answer
-                answer = sanitize_answer_text(text, raw_retry)
-                if not looks_noisy_answer(text, answer):
-                    break
+            raw_retry = call_chain_safe(retry_question[:600], True)
+            last_raw_answer = raw_retry or last_raw_answer
+            answer = sanitize_answer_text(text, raw_retry)
 
         if greeting_mode and (not answer or looks_noisy_answer(text, answer) or len(answer) > 180):
             greeting_retry = (
                 "Người dùng vừa chào. "
                 "Hãy chào lại bằng tiếng Việt có dấu trong 1 câu dưới 20 từ, thân thiện, không ký tự lạ."
             )
-            gr = chain({"question": greeting_retry, "skip_retrieval": True})
-            raw_gr = str(gr.get("answer", "")).strip()
+            raw_gr = call_chain_safe(greeting_retry, True)
             last_raw_answer = raw_gr or last_raw_answer
             answer = sanitize_answer_text(text, raw_gr)
 
@@ -596,8 +588,7 @@ def run_local_chat_query(user_text: str) -> dict:
                 "Hãy viết lại câu sau bằng tiếng Việt có dấu, giữ nguyên nghĩa, ngắn gọn và tự nhiên:\n"
                 f"{answer[:300]}"
             )
-            rewritten = chain({"question": rewrite_q, "skip_retrieval": True})
-            raw_rewrite = str(rewritten.get("answer", "")).strip()
+            raw_rewrite = call_chain_safe(rewrite_q, True)
             last_raw_answer = raw_rewrite or last_raw_answer
             rewritten_answer = sanitize_answer_text(text, raw_rewrite)
             if rewritten_answer:
@@ -606,11 +597,9 @@ def run_local_chat_query(user_text: str) -> dict:
         if not answer or looks_noisy_answer(text, answer):
             final_retry_q = (
                 f"Câu hỏi: {text}\n"
-                "Trả lời trực tiếp bằng tiếng Việt trong 2-4 câu, không lặp, không trích URL, không meta-instruction."
-                " Không bịa thông tin lịch sử hội thoại."
+                "Trả lời trực tiếp bằng tiếng Việt trong 2-4 câu, không lặp, không trích URL."
             )
-            final_retry = chain({"question": final_retry_q[:600], "skip_retrieval": True})
-            raw_final_retry = str(final_retry.get("answer", "")).strip()
+            raw_final_retry = call_chain_safe(final_retry_q[:600], True)
             last_raw_answer = raw_final_retry or last_raw_answer
             answer = sanitize_answer_text(text, raw_final_retry)
 
@@ -619,18 +608,15 @@ def run_local_chat_query(user_text: str) -> dict:
                 f"Người dùng hỏi: {text}\n"
                 f"Bản nháp có lỗi: {answer[:380]}\n"
                 "Hãy viết lại một câu trả lời sạch bằng tiếng Việt tự nhiên trong 2-3 câu."
-                " Không thêm lịch sử hội thoại nếu người dùng chưa cung cấp."
             )
-            rewritten = chain({"question": rewrite_q[:700], "skip_retrieval": True})
-            raw_rewritten = str(rewritten.get("answer", "")).strip()
+            raw_rewritten = call_chain_safe(rewrite_q[:700], True)
             last_raw_answer = raw_rewritten or last_raw_answer
             answer = sanitize_answer_text(text, raw_rewritten)
 
         if not answer:
-            fallback_raw = URL_RE.sub("", (last_raw_answer or "")).strip()
-            fallback_raw = re.sub(r"\s+", " ", fallback_raw)
-            if fallback_raw:
-                return {"ok": True, "answer": fallback_raw[:280], "source": "local_ai"}
+            fallback_answer = sanitize_answer_text(text, last_raw_answer or "")
+            if fallback_answer and not looks_noisy_answer(text, fallback_answer):
+                return {"ok": True, "answer": fallback_answer[:320], "source": "local_ai"}
             return {
                 "ok": False,
                 "answer": "AI local đã xử lý nhưng chưa tạo được câu trả lời rõ ràng. Bạn thử diễn đạt cụ thể hơn một chút nhé.",
