@@ -315,6 +315,14 @@
 
       pendingLocalAnswers.push({ question, answer, baselineBotCount, ts: Date.now() });
       tryApplyPendingAnswer(inputEl);
+
+      // Ensure input is not locked forever if UI structure changed and patch did not apply.
+      win.setTimeout(() => {
+        tryApplyPendingAnswer(inputEl);
+        if (localRequestInFlight) {
+          localRequestInFlight = false;
+        }
+      }, 2200);
     }
 
     function handlePortalSubmit(inputEl) {
@@ -365,6 +373,28 @@
         sendBtn.setAttribute("data-local-ai-bound", "1");
         sendBtn.addEventListener("click", () => {
           handlePortalSubmit(inputEl);
+        }, true);
+      }
+
+      if (doc.body && !doc.body.getAttribute("data-local-ai-click-bound")) {
+        doc.body.setAttribute("data-local-ai-click-bound", "1");
+        doc.body.addEventListener("click", (event) => {
+          const target = event && event.target;
+          if (!target || typeof target.closest !== "function") {
+            return;
+          }
+          const btn = target.closest("button");
+          if (!btn) {
+            return;
+          }
+          const label = (btn.textContent || "").trim();
+          if (!label.includes("Gửi")) {
+            return;
+          }
+          const activeInput = getGreenChatInput();
+          if (activeInput) {
+            handlePortalSubmit(activeInput);
+          }
         }, true);
       }
 

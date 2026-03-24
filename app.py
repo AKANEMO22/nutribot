@@ -32,19 +32,109 @@ MODEL_STATE = {
     "ready": False,
     "error": "",
 }
+NUTRITION_DB_CACHE = None
 
 
-def is_simple_greeting(text: str) -> bool:
-    normalized = (text or "").strip().lower()
-    return normalized in {
-        "hi",
-        "hello",
-        "hey",
-        "xin chao",
-        "xin chào",
-        "chao",
-        "chào",
-    }
+def normalize_food_name(text: str) -> str:
+    base = (text or "").strip().lower()
+    base = re.sub(r"\s+", " ", base)
+    replacements = str.maketrans(
+        {
+            "à": "a", "á": "a", "ạ": "a", "ả": "a", "ã": "a",
+            "â": "a", "ầ": "a", "ấ": "a", "ậ": "a", "ẩ": "a", "ẫ": "a",
+            "ă": "a", "ằ": "a", "ắ": "a", "ặ": "a", "ẳ": "a", "ẵ": "a",
+            "è": "e", "é": "e", "ẹ": "e", "ẻ": "e", "ẽ": "e",
+            "ê": "e", "ề": "e", "ế": "e", "ệ": "e", "ể": "e", "ễ": "e",
+            "ì": "i", "í": "i", "ị": "i", "ỉ": "i", "ĩ": "i",
+            "ò": "o", "ó": "o", "ọ": "o", "ỏ": "o", "õ": "o",
+            "ô": "o", "ồ": "o", "ố": "o", "ộ": "o", "ổ": "o", "ỗ": "o",
+            "ơ": "o", "ờ": "o", "ớ": "o", "ợ": "o", "ở": "o", "ỡ": "o",
+            "ù": "u", "ú": "u", "ụ": "u", "ủ": "u", "ũ": "u",
+            "ư": "u", "ừ": "u", "ứ": "u", "ự": "u", "ử": "u", "ữ": "u",
+            "ỳ": "y", "ý": "y", "ỵ": "y", "ỷ": "y", "ỹ": "y",
+            "đ": "d",
+        }
+    )
+    return base.translate(replacements)
+
+
+def load_nutrition_db_from_dashboard() -> dict:
+    global NUTRITION_DB_CACHE
+    if isinstance(NUTRITION_DB_CACHE, dict):
+        return NUTRITION_DB_CACHE
+
+    nutrition_db = {}
+    js_path = BASE_DIR / "streamlit_assets" / "embedded_fpt_build" / "assets" / "dashboard-sync.js"
+    if not js_path.exists():
+        NUTRITION_DB_CACHE = nutrition_db
+        return nutrition_db
+
+    try:
+        content = js_path.read_text(encoding="utf-8")
+        block_match = re.search(r"const\s+FOOD_NUTRITION_DB\s*=\s*\{(.*?)\};", content, re.DOTALL)
+        if not block_match:
+            NUTRITION_DB_CACHE = nutrition_db
+            return nutrition_db
+
+        entry_re = re.compile(
+            r"^\s*(?:\"([^\"]+)\"|([A-Za-zÀ-ỹà-ỹĐđ_][A-Za-z0-9À-ỹà-ỹĐđ_\s]*))\s*:\s*\{\s*"
+            r"calories:\s*([0-9.]+)\s*,\s*protein:\s*([0-9.]+)\s*,\s*carbs:\s*([0-9.]+)\s*,\s*fat:\s*([0-9.]+)\s*\}\s*,?\s*$"
+        )
+
+        for raw_line in block_match.group(1).splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            m = entry_re.match(line)
+            if not m:
+                continue
+
+            food_name = (m.group(1) or m.group(2) or "").strip()
+            if not food_name:
+                continue
+
+            nutrition_db[normalize_food_name(food_name)] = {
+                "name": food_name,
+                "calories": float(m.group(3)),
+                "protein": float(m.group(4)),
+                "carbs": float(m.group(5)),
+                "fat": float(m.group(6)),
+            }
+    except Exception:
+        nutrition_db = {}
+
+    NUTRITION_DB_CACHE = nutrition_db
+    return nutrition_db
+
+
+def build_nutrition_context(question: str, limit: int = 10) -> str:
+    nutrition_db = load_nutrition_db_from_dashboard()
+    if not nutrition_db:
+        return ""
+
+    normalized_q = normalize_food_name(question)
+    matched = []
+    for key, info in nutrition_db.items():
+        if key and key in normalized_q:
+            matched.append(info)
+
+    has_nutrition_intent = any(
+        token in normalized_q
+        for token in ("calo", "calories", "protein", "carb", "fat", "beo", "thuc don", "mon an", "giam can", "tang can")
+    )
+
+    if not matched and has_nutrition_intent:
+        matched = list(nutrition_db.values())[:limit]
+
+    if not matched:
+        return ""
+
+    lines = ["Du lieu chi so dinh duong noi bo (tu module nhap mon an):"]
+    for item in matched[:limit]:
+        lines.append(
+            f"- {item['name']}: {item['calories']:.0f} kcal, protein {item['protein']:.1f}g, carbs {item['carbs']:.1f}g, fat {item['fat']:.1f}g"
+        )
+    return "\n".join(lines)
 
 
 def load_rag_and_models():
@@ -104,13 +194,6 @@ def run_local_chat_query(user_text: str) -> dict:
     if not text:
         return {"ok": False, "answer": "Vui lòng nhập câu hỏi."}
 
-    if is_simple_greeting(text):
-        return {
-            "ok": True,
-            "answer": "Chào bạn! Mình là NutriBot AI local. Bạn có thể hỏi về calories, protein, thực đơn hoặc phân tích bữa ăn.",
-            "source": "local_ai",
-        }
-
     state = ensure_models_loaded()
     q_filter_instance = state.get("q_filter")
     chain = state.get("rag_chain")
@@ -136,7 +219,16 @@ def run_local_chat_query(user_text: str) -> dict:
             pass
 
     try:
-        result = chain({"question": text})
+        nutrition_context = build_nutrition_context(text)
+        final_question = text
+        if nutrition_context:
+            final_question = (
+                f"{text}\n\n"
+                f"{nutrition_context}\n"
+                "Khi tra loi, uu tien su dung du lieu noi bo o tren neu lien quan."
+            )
+
+        result = chain({"question": final_question})
         answer = result.get("answer", "Xin lỗi, tôi chưa có câu trả lời phù hợp.")
         return {"ok": True, "answer": answer, "source": "local_ai"}
     except Exception as exc:
