@@ -131,8 +131,8 @@ st.set_page_config(page_title="Nutrious Consultant", layout="wide")
 def load_rag_and_models():
     # 1. Khởi tạo Q_Filter
     q_filter_instance = None
-    if Path("models/question_filter_model.pkl").exists():
-        q_filter_instance = QuestionFilter(model_path="models/question_filter_model.pkl")
+    if Path("weight/question_filter_model.pkl").exists():
+        q_filter_instance = QuestionFilter(model_path="weight/question_filter_model.pkl")
     
     # 2. Khởi tạo RAG Chain
     if check_ollama():
@@ -220,7 +220,10 @@ with col2:
     st.markdown("<h3 style='text-align: center;'>🤖 NutriBot Chat</h3>", unsafe_allow_html=True)
     
     if not ollama_ok:
-        st.error("Ollama chưa chạy. Vui lòng bật Ollama trên máy tính của bạn!")
+        if CONFIG.get("llm_backend") == "ollama":
+            st.error("Ollama chưa chạy. Vui lòng bật Ollama trên máy tính của bạn!")
+        else:
+            st.error("Chưa có local weights. Chạy: python script_download/download_local_weights.py")
     else:
         # Khởi tạo session state lưu trữ chat
         if "messages" not in st.session_state:

@@ -37,6 +37,9 @@ console = Console()
 
 # ── Config ───────────────────────────────────────────────────────────────────
 CONFIG = {
+    # Backend: "ollama" hoặc "local_hf"
+    "llm_backend": "local_hf",
+
     # Model Ollama để chat (chạy: ollama list để xem models đã pull)
     "llm_model": "llama3.2",
 
@@ -46,6 +49,8 @@ CONFIG = {
 
     # Thư mục lưu ChromaDB
     "chroma_dir": "./chroma_db",
+    "chroma_dir_ollama": "./chroma_db",
+    "chroma_dir_local_hf": "./chroma_db_local_hf",
 
     # Thư mục chứa tài liệu cần index
     "docs_dir": "./documents",
@@ -59,11 +64,24 @@ CONFIG = {
 
     # URL Ollama (mặc định local)
     "ollama_base_url": "http://localhost:11434",
+
+    # ===== Local HuggingFace (không cần Ollama) =====
+    "weight_dir": "./weight",
+    "hf_llm_model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    "hf_llm_local_dir": "./weight/llm/qwen2.5-1.5b-instruct",
+    "hf_embed_model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "hf_embed_local_dir": "./weight/embeddings/paraphrase-multilingual-minilm-l12-v2",
+    "hf_max_new_tokens": 256,
 }
 
 
 def check_ollama():
-    """Kiểm tra Ollama đang chạy không."""
+    """Giữ tương thích tên hàm cũ: kiểm tra backend hiện tại đã sẵn sàng chưa."""
+    if CONFIG.get("llm_backend") != "ollama":
+        llm_dir = Path(CONFIG["hf_llm_local_dir"])
+        emb_dir = Path(CONFIG["hf_embed_local_dir"])
+        return llm_dir.exists() and emb_dir.exists()
+
     import urllib.request
     try:
         urllib.request.urlopen(CONFIG["ollama_base_url"], timeout=3)
@@ -111,22 +129,44 @@ def load_documents(docs_dir: str):
     return all_docs
 
 
+def resolve_chroma_dir() -> str:
+    if CONFIG.get("llm_backend") == "ollama":
+        return CONFIG.get("chroma_dir_ollama", CONFIG.get("chroma_dir", "./chroma_db"))
+    return CONFIG.get("chroma_dir_local_hf", "./chroma_db_local_hf")
+
+
 def build_vectorstore(force_rebuild: bool = False):
     """
     Tạo hoặc load ChromaDB vector store.
     force_rebuild=True sẽ xóa DB cũ và index lại.
     """
-    from langchain_ollama import OllamaEmbeddings
     from langchain_chroma import Chroma
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-    # Embedding model local qua Ollama
-    embeddings = OllamaEmbeddings(
-        model=CONFIG["embed_model"],
-        base_url=CONFIG["ollama_base_url"],
-    )
+    if CONFIG.get("llm_backend") == "ollama":
+        from langchain_ollama import OllamaEmbeddings
 
-    chroma_path = CONFIG["chroma_dir"]
+        embeddings = OllamaEmbeddings(
+            model=CONFIG["embed_model"],
+            base_url=CONFIG["ollama_base_url"],
+        )
+    else:
+        from langchain_huggingface import HuggingFaceEmbeddings
+
+        embed_dir = Path(CONFIG["hf_embed_local_dir"])
+        if not embed_dir.exists():
+            raise RuntimeError(
+                "Thiếu local embedding weights. Hãy chạy: "
+                "python script_download/download_local_weights.py"
+            )
+
+        embeddings = HuggingFaceEmbeddings(
+            model_name=str(embed_dir),
+            model_kwargs={"device": "cpu", "local_files_only": True},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+
+    chroma_path = resolve_chroma_dir()
 
     # Nếu DB đã tồn tại và không cần rebuild → load lại
     if Path(chroma_path).exists() and not force_rebuild:
@@ -182,18 +222,44 @@ def build_vectorstore(force_rebuild: bool = False):
 
 
 def build_rag_chain(vectorstore):
-    """Tạo RAG chain với Ollama LLM (LCEL style)."""
-    from langchain_ollama import ChatOllama
+    """Tạo RAG chain với backend LLM đã cấu hình (Ollama hoặc local HF)."""
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-    from langchain_core.runnables import RunnablePassthrough
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.messages import HumanMessage, AIMessage
 
-    llm = ChatOllama(
-        model=CONFIG["llm_model"],
-        base_url=CONFIG["ollama_base_url"],
-        temperature=0.1,
-    )
+    if CONFIG.get("llm_backend") == "ollama":
+        from langchain_ollama import ChatOllama
+
+        llm = ChatOllama(
+            model=CONFIG["llm_model"],
+            base_url=CONFIG["ollama_base_url"],
+            temperature=0.1,
+        )
+    else:
+        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+        from langchain_huggingface import HuggingFacePipeline
+
+        llm_dir = Path(CONFIG["hf_llm_local_dir"])
+        if not llm_dir.exists():
+            raise RuntimeError(
+                "Thiếu local LLM weights. Hãy chạy: "
+                "python script_download/download_local_weights.py"
+            )
+
+        tokenizer = AutoTokenizer.from_pretrained(str(llm_dir), local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(str(llm_dir), local_files_only=True)
+        generator = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=CONFIG["hf_max_new_tokens"],
+            do_sample=True,
+            temperature=0.2,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            return_full_text=False,
+        )
+        llm = HuggingFacePipeline(pipeline=generator)
 
     retriever = vectorstore.as_retriever(
         search_type="similarity",
@@ -250,6 +316,7 @@ def show_welcome():
     """Màn hình chào."""
     console.print(Panel.fit(
         "[bold cyan]🤖 Local RAG Chatbot[/bold cyan]\n"
+        f"[dim]Backend:[/dim] [green]{CONFIG['llm_backend']}[/green]  "
         f"[dim]LLM:[/dim] [green]{CONFIG['llm_model']}[/green]  "
         f"[dim]Embedding:[/dim] [green]{CONFIG['embed_model']}[/green]  "
         f"[dim]Vector DB:[/dim] [green]ChromaDB (local)[/green]\n\n"
@@ -297,22 +364,36 @@ def show_sources(source_docs):
 def main():
     show_welcome()
 
-    # Kiểm tra Ollama
+    # Kiểm tra backend
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-        t = p.add_task("Kiểm tra Ollama...", total=None)
+        check_label = "Kiểm tra Ollama..." if CONFIG.get("llm_backend") == "ollama" else "Kiểm tra local weights..."
+        t = p.add_task(check_label, total=None)
         ok = check_ollama()
-        p.update(t, description="✓ Ollama đang chạy" if ok else "✗ Ollama không phản hồi")
+        if CONFIG.get("llm_backend") == "ollama":
+            p.update(t, description="✓ Ollama đang chạy" if ok else "✗ Ollama không phản hồi")
+        else:
+            p.update(t, description="✓ Local weights sẵn sàng" if ok else "✗ Thiếu local weights")
 
     if not ok:
-        console.print(Panel(
-            "[red]Ollama chưa chạy![/red]\n\n"
-            "Khởi động Ollama:\n"
-            "  [bold]ollama serve[/bold]\n\n"
-            "Pull models cần thiết:\n"
-            f"  [bold]ollama pull {CONFIG['llm_model']}[/bold]\n"
-            f"  [bold]ollama pull {CONFIG['embed_model']}[/bold]",
-            border_style="red",
-        ))
+        if CONFIG.get("llm_backend") == "ollama":
+            console.print(Panel(
+                "[red]Ollama chưa chạy![/red]\n\n"
+                "Khởi động Ollama:\n"
+                "  [bold]ollama serve[/bold]\n\n"
+                "Pull models cần thiết:\n"
+                f"  [bold]ollama pull {CONFIG['llm_model']}[/bold]\n"
+                f"  [bold]ollama pull {CONFIG['embed_model']}[/bold]",
+                border_style="red",
+            ))
+        else:
+            console.print(Panel(
+                "[red]Chưa có local weights trong project![/red]\n\n"
+                "Tải model vào thư mục weight/:\n"
+                "  [bold]python script_download/download_local_weights.py[/bold]\n\n"
+                f"LLM dir: [cyan]{CONFIG['hf_llm_local_dir']}[/cyan]\n"
+                f"Embedding dir: [cyan]{CONFIG['hf_embed_local_dir']}[/cyan]",
+                border_style="red",
+            ))
         sys.exit(1)
 
     # Build vector store
@@ -327,7 +408,7 @@ def main():
     console.print("[cyan]Đang tải hệ thống Lọc câu hỏi (Question Filter)...[/cyan]")
     q_filter = None
     try:
-        q_filter = QuestionFilter(model_path="models/question_filter_model.pkl")
+        q_filter = QuestionFilter(model_path="weight/question_filter_model.pkl")
     except Exception as e:
         console.print(f"[yellow]Cảnh báo: Không thể tải Question Filter (Lỗi: {e}). Bỏ qua lọc.[/yellow]")
 

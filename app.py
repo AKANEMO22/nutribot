@@ -137,8 +137,8 @@ st.set_page_config(page_title="Nutrious Consultant", layout="wide")
 def load_rag_and_models():
     # 1. Khởi tạo Q_Filter
     q_filter_instance = None
-    if Path("models/question_filter_model.pkl").exists():
-        q_filter_instance = QuestionFilter(model_path="models/question_filter_model.pkl")
+    if Path("weight/question_filter_model.pkl").exists():
+        q_filter_instance = QuestionFilter(model_path="weight/question_filter_model.pkl")
     
     # 2. Khởi tạo RAG Chain
     if check_ollama():

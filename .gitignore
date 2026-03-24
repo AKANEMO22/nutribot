@@ -1,2 +1,12 @@
 .venv/
 nbvenv/
+
+# Model artifacts / local runtime data
+weight/*
+!weight/
+!weight/.gitkeep
+models/*.pkl
+chroma_db/
+chroma_db_local_hf/
+data/generative_data.db
+__pycache__/
