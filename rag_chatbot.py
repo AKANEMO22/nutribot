@@ -31,6 +31,8 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import print as rprint
 
+from question_filter import QuestionFilter
+
 console = Console()
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -320,6 +322,15 @@ def main():
     # Build RAG chain
     console.print("[cyan]Đang khởi tạo RAG chain...[/cyan]")
     chain = build_rag_chain(vectorstore)
+
+    # Khởi tạo mô hình Question Filter
+    console.print("[cyan]Đang tải hệ thống Lọc câu hỏi (Question Filter)...[/cyan]")
+    q_filter = None
+    try:
+        q_filter = QuestionFilter(model_path="models/question_filter_model.pkl")
+    except Exception as e:
+        console.print(f"[yellow]Cảnh báo: Không thể tải Question Filter (Lỗi: {e}). Bỏ qua lọc.[/yellow]")
+
     console.print("[green]✓ Sẵn sàng! Bắt đầu chat.[/green]\n")
 
     # Chat loop
@@ -376,7 +387,17 @@ def main():
             console.print(table)
             continue
 
-        # Gọi RAG chain
+        # 1. KIỂM TRA BẰNG QUESTION FILTER TRƯỚC
+        if q_filter:
+            try:
+                is_danger = q_filter.is_dangerous(user_input)
+                if is_danger:
+                    console.print("[red]⚠️ [CẢNH BÁO] Phát hiện nội dung nhạy cảm, độc hại hoặc nằm trong blocklist (Jailbreak/Prompt Injection). Chatbot từ chối xử lý.[/red]")
+                    continue
+            except Exception as e:
+                pass  # Bỏ qua nếu lỗi lọc
+
+        # 2. Gọi RAG chain
         with Progress(
             SpinnerColumn(),
             TextColumn("[dim]Đang tìm kiếm và sinh câu trả lời...[/dim]"),

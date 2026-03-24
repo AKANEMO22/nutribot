@@ -17,6 +17,7 @@ function run() {
 
   const mealCard = {
     querySelector: (selector) => {
+      if (selector === ".text-2xl.bg-gradient-to-r") return totalEl;
       if (selector === ".text-2xl") return totalEl;
       if (selector === ".text-xl") return { textContent: "dummy" };
       return null;

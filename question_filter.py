@@ -61,6 +61,8 @@ class QuestionFilter:
         return bool(prediction)
 
 if __name__ == "__main__":
+    import sys
+    sys.stdout.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description="Question Filter using TF-IDF and Logistic Regression")
     
     # Subcommands for train and predict to avoid hardcoding params

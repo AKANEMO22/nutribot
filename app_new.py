@@ -100,12 +100,6 @@ class SilentStaticHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
-        super().end_headers()
-
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -150,70 +144,127 @@ def load_rag_and_models():
 
 q_filter, rag_chain, ollama_ok = load_rag_and_models()
 
-build_dir, build_status = resolve_fpt_build_dir()
-server_url, server_status = ensure_static_server(build_dir) if build_dir else (None, "")
-inline_html = build_inline_react_html(build_dir) if build_dir else ""
+# Chia UI làm 2 cột: 75% cho Web Portal, 25% cho Chatbot
+col1, col2 = st.columns([3, 1])
 
-st.markdown(
-    """
-    <style>
-    html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {  
-        height: 100%;
-        overflow: hidden;
-    }
-    [data-testid="stAppViewContainer"] {
-        background: transparent;
-    }
-    header[data-testid="stHeader"],
-    div[data-testid="stToolbar"],
-    div[data-testid="stDecoration"],
-    #MainMenu,
-    footer {
-        visibility: hidden;
-        height: 0;
-    }
-    .block-container {
-        padding-top: 0;
-        padding-bottom: 0;
-        padding-left: 0;
-        padding-right: 0;
-        max-width: 100%;
-    }
-    [data-testid="stVerticalBlock"] {
-        gap: 0;
-    }
-    .element-container, [data-testid="stElementContainer"] {
-        margin: 0 !important;
-        padding: 0 !important;
-    }
-    .fpt-fullscreen-wrap {
-        position: relative;
-        width: 100%;
-        height: 100vh;
-        overflow: hidden;
-        z-index: 1;
-    }
-    .fpt-fullscreen-wrap iframe {
-        width: 100%;
-        height: 100%;
-        border: 0;
-        display: block;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+with col1:
+    build_dir, build_status = resolve_fpt_build_dir()
+    server_url, server_status = ensure_static_server(build_dir) if build_dir else (None, "")
+    inline_html = build_inline_react_html(build_dir) if build_dir else ""
 
-if server_url:
     st.markdown(
-        f"""
-        <div class="fpt-fullscreen-wrap">
-        <iframe src="{server_url}" title="FPT University Portal Redesign"></iframe>
-        </div>
+        """
+        <style>
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {  
+            height: 100%;
+            overflow: hidden;
+        }
+        [data-testid="stAppViewContainer"] {
+            background: transparent;
+        }
+        header[data-testid="stHeader"],
+        div[data-testid="stToolbar"],
+        div[data-testid="stDecoration"],
+        #MainMenu,
+        footer {
+            visibility: hidden;
+            height: 0;
+        }
+        .block-container {
+            padding-top: 0;
+            padding-bottom: 0;
+            padding-left: 0;
+            padding-right: 0;
+            max-width: 100%;
+        }
+        [data-testid="stVerticalBlock"] {
+            gap: 0;
+        }
+        .element-container, [data-testid="stElementContainer"] {
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        .fpt-fullscreen-wrap {
+            position: relative;
+            width: 100%;
+            height: 100vh;
+            overflow: hidden;
+            z-index: 1;
+        }
+        .fpt-fullscreen-wrap iframe {
+            width: 100%;
+            height: 100%;
+            border: 0;
+            display: block;
+        }
+        </style>
         """,
         unsafe_allow_html=True,
     )
-elif inline_html:
-    components.html(inline_html, height=900, scrolling=False)
-else:
-    st.error(build_status or "Khong tim thay ban build FPT.")
+
+    if server_url:
+        st.markdown(
+            f"""
+            <div class="fpt-fullscreen-wrap">
+            <iframe src="{server_url}" title="FPT University Portal Redesign"></iframe>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif inline_html:
+        components.html(inline_html, height=900, scrolling=False)
+    else:
+        st.error(build_status or "Khong tim thay ban build FPT.")
+
+with col2:
+    st.markdown("<h3 style='text-align: center;'>🤖 NutriBot Chat</h3>", unsafe_allow_html=True)
+    
+    if not ollama_ok:
+        st.error("Ollama chưa chạy. Vui lòng bật Ollama trên máy tính của bạn!")
+    else:
+        # Khởi tạo session state lưu trữ chat
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        # Hiển thị tin nhắn cũ
+        chat_container = st.container(height=600)
+        with chat_container:
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+        # Chat Input
+        if prompt := st.chat_input("Hãy hỏi NutriBot..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with chat_container:
+                with st.chat_message(role="user"):
+                    st.markdown(prompt)
+
+            # --- QUESTION FILTER LAYER ---
+            is_blocked = False
+            if q_filter:
+                try:
+                    if q_filter.is_dangerous(prompt):
+                        is_blocked = True
+                except Exception as e:
+                    pass
+
+            if is_blocked:
+                # Nếu câu hỏi bị chặn bởi mô hình Filter
+                response_text = "⚠️ **[CẢNH BÁO]** Phát hiện nội dung nhạy cảm, độc hại. Hệ thống từ chối trả lời để đảm bảo an toàn."
+                with chat_container:
+                    with st.chat_message(role="assistant"):
+                        st.markdown(response_text)
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+            else:
+                # --- RAG CHAIN EXECUTION ---
+                with chat_container:
+                    with st.chat_message(role="assistant"):
+                        with st.spinner("Đang suy nghĩ..."):
+                            try:
+                                result = rag_chain({"question": prompt})
+                                answer = result.get("answer", "Xin lỗi, tôi không thể trả lời câu hỏi này lúc này.")
+                            except Exception as e:
+                                answer = f"Đã có lỗi xảy ra: {e}"
+                        st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
