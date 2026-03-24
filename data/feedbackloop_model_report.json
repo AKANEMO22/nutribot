@@ -1,0 +1,84 @@
+{
+  "created_at": 1774350668,
+  "rounds": 2,
+  "max_cycles": 2,
+  "stable": true,
+  "cycles": [
+    {
+      "cycle": 1,
+      "summary": {
+        "total": 6,
+        "ok_rate": 1.0,
+        "blocked_rate": 0.0,
+        "timeout_like_rate": 0.0,
+        "low_quality_rate": 0.0,
+        "latency_avg_sec": 27.959,
+        "latency_p95_sec": 50.546,
+        "hi_is_stable": true,
+        "stable": true
+      },
+      "records": [
+        {
+          "prompt": "hi",
+          "ok": true,
+          "blocked": false,
+          "timeout_like": false,
+          "low_quality": false,
+          "latency_sec": 50.172,
+          "answer_preview": "Chao ban! Toi la NutriBot, ban muon minh ho tro calories hay thuc don hom nay?",
+          "cycle": 1
+        },
+        {
+          "prompt": "lap ke hoach giam can trong 1 thang",
+          "ok": true,
+          "blocked": false,
+          "timeout_like": false,
+          "low_quality": false,
+          "latency_sec": 16.773,
+          "answer_preview": "g\n- banh mi thu: 250 kcal, protein 10.0g, carbs 20.0g, fat 10.0g\n- banh mi ket thuc: 300 kcal, protein 15.0g, carbs 25.0g, fat 10.0g\n- banh mi ket thuc: 350 kcal, protein 20.0g, ca",
+          "cycle": 1
+        },
+        {
+          "prompt": "100g uc ga co bao nhieu protein",
+          "ok": true,
+          "blocked": false,
+          "timeout_like": false,
+          "low_quality": false,
+          "latency_sec": 17.004,
+          "answer_preview": "Trả lời ngắn gọn, rõ ràng và chính xác. Ưu tiên dùng tiếng Việt nếu câu hỏi bằng tiếng Việt. Nếu không có giá trị trả lời bằng tiếng Việt, hãy trả lời bằng tiếng Anh.\n\nCâu hỏi: \nDự",
+          "cycle": 1
+        },
+        {
+          "prompt": "hi",
+          "ok": true,
+          "blocked": false,
+          "timeout_like": false,
+          "low_quality": false,
+          "latency_sec": 49.597,
+          "answer_preview": "Chao ban! Toi la NutriBot, ban muon minh ho tro calories hay thuc don hom nay?",
+          "cycle": 1
+        },
+        {
+          "prompt": "lap ke hoach giam can trong 1 thang",
+          "ok": true,
+          "blocked": false,
+          "timeout_like": false,
+          "low_quality": false,
+          "latency_sec": 17.113,
+          "answer_preview": "g\n- banh mi thu: 260 kcal, protein 10.0g, carbs 20.0g, fat 10.0g\n- banh mi nhat: 300 kcal, protein 15.0g, carbs 25.0g, fat 15.0g\n\nDuyet: 1 thang sau khi ăn banh mi thu, banh mi tru",
+          "cycle": 1
+        },
+        {
+          "prompt": "100g uc ga co bao nhieu protein",
+          "ok": true,
+          "blocked": false,
+          "timeout_like": false,
+          "low_quality": false,
+          "latency_sec": 17.096,
+          "answer_preview": "Nguyễn: 100g uc ga co bao nhieu protein? \nTổng số lượng protein trong diem này là 35.0g. \nDựa vào liệu pháp dinh dưỡng, lượng protein cần thiết là 75% hoặc ít hơn. \nVì vậy, lượng p",
+          "cycle": 1
+        }
+      ]
+    }
+  ]
+}

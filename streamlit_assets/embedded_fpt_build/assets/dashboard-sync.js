@@ -138,7 +138,6 @@
   function createDashboardSync(doc = globalScope.document, win = globalScope.window) {
     let isApplying = false;
     let lastAppliedSignature = null;
-    const pendingLocalAnswers = [];
     let localRequestInFlight = false;
     let syncScheduled = false;
     let lastSyncTs = 0;
@@ -246,52 +245,63 @@
       contentWrap.appendChild(row);
     }
 
-    function tryApplyPendingAnswer(inputEl) {
-      if (!pendingLocalAnswers.length) {
-        return;
-      }
-
-      const now = Date.now();
-      while (pendingLocalAnswers.length && now - pendingLocalAnswers[0].ts > 120000) {
-        pendingLocalAnswers.shift();
-      }
-      if (!pendingLocalAnswers.length) {
-        return;
-      }
-
-      const messageList = getGreenChatMessageList(inputEl);
-      const botRows = getBotRows(messageList);
-      if (!botRows.length) {
-        return;
-      }
-
-      const pending = pendingLocalAnswers[0];
-      const ageMs = now - pending.ts;
-      const hasExpectedNewBotRow = botRows.length > pending.baselineBotCount;
-      const canForcePatchLatest = ageMs > 1500;
-      if (!hasExpectedNewBotRow && !canForcePatchLatest) {
-        return;
-      }
-
-      const latestBotRow = botRows[botRows.length - 1];
-      const textNode = latestBotRow.querySelector("p.whitespace-pre-line.leading-relaxed");
-      if (!textNode) {
-        return;
-      }
-
-      textNode.textContent = pending.answer;
-      latestBotRow.setAttribute("data-local-ai-patched", "1");
-      attachFeedbackButtons(latestBotRow, pending.question, pending.answer);
-      pendingLocalAnswers.shift();
-      localRequestInFlight = false;
+    function createAvatar(isUser) {
+      const avatar = doc.createElement("div");
+      avatar.className = isUser
+        ? "w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 shadow-lg bg-gradient-to-br from-blue-500 to-cyan-600"
+        : "w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 shadow-lg bg-gradient-to-br from-green-500 to-emerald-600";
+      avatar.textContent = isUser ? "👤" : "🤖";
+      avatar.style.fontSize = "18px";
+      return avatar;
     }
 
-    async function requestPortalLocalAnswer(question, baselineBotCount, inputEl) {
+    function nowHHMM() {
+      return new Date().toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function appendPortalMessage(inputEl, role, text) {
+      const messageList = getGreenChatMessageList(inputEl);
+      if (!messageList || typeof doc.createElement !== "function") {
+        return null;
+      }
+
+      const row = doc.createElement("div");
+      row.className = role === "user" ? "flex gap-3 flex-row-reverse" : "flex gap-3 flex-row";
+
+      const contentWrap = doc.createElement("div");
+      contentWrap.className = "flex flex-col gap-2 max-w-[70%]";
+
+      const bubble = doc.createElement("div");
+      bubble.className = role === "user"
+        ? "rounded-2xl px-5 py-3 shadow-lg bg-gradient-to-br from-blue-500 to-cyan-600 text-white"
+        : "rounded-2xl px-5 py-3 shadow-lg bg-white text-gray-800 border border-gray-100";
+
+      const p = doc.createElement("p");
+      p.className = "whitespace-pre-line leading-relaxed";
+      p.textContent = text;
+      bubble.appendChild(p);
+
+      const ts = doc.createElement("p");
+      ts.className = "text-xs text-gray-400 px-2";
+      ts.textContent = nowHHMM();
+
+      contentWrap.appendChild(bubble);
+      contentWrap.appendChild(ts);
+
+      row.appendChild(createAvatar(role === "user"));
+      row.appendChild(contentWrap);
+      messageList.appendChild(row);
+      messageList.scrollTop = messageList.scrollHeight;
+      return row;
+    }
+
+    async function requestPortalLocalAnswer(question, inputEl) {
       let answer = "Không có phản hồi từ AI local.";
+      const pendingRow = appendPortalMessage(inputEl, "assistant", "Dang xu ly, vui long doi trong giay lat...");
       try {
         const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
         const timeoutId = controller
-          ? win.setTimeout(() => controller.abort(), 45000)
+          ? win.setTimeout(() => controller.abort(), 120000)
           : null;
 
         const response = await fetch("/api/local-chat", {
@@ -313,16 +323,20 @@
         answer = "AI local phản hồi chậm hoặc lỗi kết nối. Vui lòng thử lại với câu hỏi ngắn hơn.";
       }
 
-      pendingLocalAnswers.push({ question, answer, baselineBotCount, ts: Date.now() });
-      tryApplyPendingAnswer(inputEl);
-
-      // Ensure input is not locked forever if UI structure changed and patch did not apply.
-      win.setTimeout(() => {
-        tryApplyPendingAnswer(inputEl);
-        if (localRequestInFlight) {
-          localRequestInFlight = false;
+      try {
+        const textNode = pendingRow
+          ? pendingRow.querySelector("p.whitespace-pre-line.leading-relaxed")
+          : null;
+        if (textNode) {
+          textNode.textContent = answer;
+          attachFeedbackButtons(pendingRow, question, answer);
+        } else {
+          const botRow = appendPortalMessage(inputEl, "assistant", answer);
+          attachFeedbackButtons(botRow, question, answer);
         }
-      }, 2200);
+      } finally {
+        localRequestInFlight = false;
+      }
     }
 
     function handlePortalSubmit(inputEl) {
@@ -346,8 +360,10 @@
       inputEl.setAttribute("data-local-last-ts", String(now));
       localRequestInFlight = true;
 
-      const baselineBotCount = getBotRows(getGreenChatMessageList(inputEl)).length;
-      requestPortalLocalAnswer(question, baselineBotCount, inputEl);
+      appendPortalMessage(inputEl, "user", question);
+      inputEl.value = "";
+      inputEl.setAttribute("data-local-draft", "");
+      requestPortalLocalAnswer(question, inputEl);
     }
 
     function wirePortalChatToLocalAI() {
@@ -363,6 +379,11 @@
         });
         inputEl.addEventListener("keydown", (event) => {
           if (event.key === "Enter") {
+            event.preventDefault();
+            if (typeof event.stopImmediatePropagation === "function") {
+              event.stopImmediatePropagation();
+            }
+            event.stopPropagation();
             handlePortalSubmit(inputEl);
           }
         }, true);
@@ -371,7 +392,12 @@
       const sendBtn = getGreenChatSendButton(inputEl);
       if (sendBtn && !sendBtn.getAttribute("data-local-ai-bound")) {
         sendBtn.setAttribute("data-local-ai-bound", "1");
-        sendBtn.addEventListener("click", () => {
+        sendBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          if (typeof event.stopImmediatePropagation === "function") {
+            event.stopImmediatePropagation();
+          }
+          event.stopPropagation();
           handlePortalSubmit(inputEl);
         }, true);
       }
@@ -391,6 +417,11 @@
           if (!label.includes("Gửi")) {
             return;
           }
+          event.preventDefault();
+          if (typeof event.stopImmediatePropagation === "function") {
+            event.stopImmediatePropagation();
+          }
+          event.stopPropagation();
           const activeInput = getGreenChatInput();
           if (activeInput) {
             handlePortalSubmit(activeInput);
@@ -398,7 +429,16 @@
         }, true);
       }
 
-      tryApplyPendingAnswer(inputEl);
+      if (doc.body && !doc.body.getAttribute("data-local-ai-warmup")) {
+        doc.body.setAttribute("data-local-ai-warmup", "1");
+        fetch("/api/warmup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        }).catch(() => {
+          // Keep warmup failure silent; normal chat request will still work.
+        });
+      }
     }
 
     function loadHistory() {

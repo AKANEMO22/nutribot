@@ -23,6 +23,7 @@ FPT_PROJECT_NAME = "FPT University Portal Redesign"
 EMBEDDED_BUILD_DIR = BASE_DIR / "streamlit_assets" / "embedded_fpt_build"       
 STATIC_SERVER = {"server": None, "thread": None, "port": None}
 FEEDBACK_LOG_PATH = BASE_DIR / "data" / "chat_feedback.jsonl"
+FEEDBACK_REPORT_PATH = BASE_DIR / "data" / "feedbackloop_live_report.json"
 FEEDBACK_LOCK = threading.Lock()
 MODEL_LOCK = threading.Lock()
 MODEL_STATE = {
@@ -33,6 +34,105 @@ MODEL_STATE = {
     "error": "",
 }
 NUTRITION_DB_CACHE = None
+MODEL_PRELOAD_STARTED = False
+
+
+def should_skip_safety_filter(text: str) -> bool:
+    normalized = normalize_food_name(text)
+    if not normalized:
+        return True
+
+    # Avoid false-positive blocks for simple greetings/short benign messages.
+    if normalized in {"hi", "hello", "hey", "xin chao", "chao"}:
+        return True
+
+    if len(normalized) <= 3 and normalized.isalpha():
+        return True
+
+    return False
+
+
+def is_short_greeting(text: str) -> bool:
+    normalized = normalize_food_name(text)
+    return normalized in {"hi", "hello", "hey", "xin chao", "chao"}
+
+
+def has_nutrition_intent(text: str) -> bool:
+    normalized = normalize_food_name(text)
+    return any(
+        token in normalized
+        for token in ("calo", "calories", "protein", "carb", "fat", "beo", "thuc don", "mon an", "giam can", "tang can")
+    )
+
+
+def looks_low_quality_answer(question: str, answer: str) -> bool:
+    q = normalize_food_name(question)
+    a = (answer or "").strip()
+    if not a:
+        return True
+
+    a_lower = a.lower()
+    if is_short_greeting(question):
+        if "http://" in a_lower or "https://" in a_lower:
+            return True
+        if len(a) > 260:
+            return True
+
+    words = re.findall(r"[A-Za-z0-9À-ỹà-ỹ]+", a)
+    if len(words) >= 12:
+        short_ratio = sum(1 for w in words if len(w) <= 2) / max(1, len(words))
+        if short_ratio > 0.55:
+            return True
+
+    if q in {"hi", "hello", "hey", "xin chao", "chao"} and len(a) > 180:
+        return True
+
+    return False
+
+
+def looks_unaccented_vietnamese(answer: str) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return False
+
+    lower = text.lower()
+    vietnamese_plain_markers = [" ban ", " toi ", " dinh duong", " calo", " thuc don", " giam can"]
+    has_plain_marker = any(m in f" {lower} " for m in vietnamese_plain_markers)
+    has_diacritic = bool(re.search(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", lower))
+    return has_plain_marker and not has_diacritic
+
+
+def build_feedback_loop_summary(limit: int = 400) -> dict:
+    if not FEEDBACK_LOG_PATH.exists():
+        return {
+            "total": 0,
+            "up": 0,
+            "down": 0,
+            "down_rate": 0.0,
+            "greeting_down_rate": 0.0,
+        }
+
+    lines = FEEDBACK_LOG_PATH.read_text(encoding="utf-8").splitlines()[-limit:]
+    items = []
+    for line in lines:
+        try:
+            items.append(json.loads(line))
+        except Exception:
+            continue
+
+    total = len(items)
+    up = sum(1 for i in items if str(i.get("rating", "")).lower() == "up")
+    down = sum(1 for i in items if str(i.get("rating", "")).lower() == "down")
+    greeting_items = [i for i in items if is_short_greeting(str(i.get("question", "")))]
+    greeting_down = sum(1 for i in greeting_items if str(i.get("rating", "")).lower() == "down")
+
+    return {
+        "total": total,
+        "up": up,
+        "down": down,
+        "down_rate": round(down / total, 4) if total else 0.0,
+        "greeting_down_rate": round(greeting_down / len(greeting_items), 4) if greeting_items else 0.0,
+    }
 
 
 def normalize_food_name(text: str) -> str:
@@ -189,10 +289,30 @@ def ensure_models_loaded(force_reload: bool = False):
         return MODEL_STATE
 
 
+def start_model_preload_once():
+    global MODEL_PRELOAD_STARTED
+    if MODEL_PRELOAD_STARTED:
+        return
+
+    MODEL_PRELOAD_STARTED = True
+
+    def _worker():
+        try:
+            ensure_models_loaded()
+        except Exception:
+            # Keep preload failures non-fatal; runtime call will surface actual error.
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def run_local_chat_query(user_text: str) -> dict:
     text = (user_text or "").strip()
     if not text:
         return {"ok": False, "answer": "Vui lòng nhập câu hỏi."}
+
+    # Keep prompt compact for small local models.
+    text = text[:320]
 
     state = ensure_models_loaded()
     q_filter_instance = state.get("q_filter")
@@ -206,7 +326,7 @@ def run_local_chat_query(user_text: str) -> dict:
             "source": "local_ai",
         }
 
-    if q_filter_instance:
+    if q_filter_instance and not should_skip_safety_filter(text):
         try:
             if q_filter_instance.is_dangerous(text):
                 return {
@@ -219,17 +339,86 @@ def run_local_chat_query(user_text: str) -> dict:
             pass
 
     try:
-        nutrition_context = build_nutrition_context(text)
-        final_question = text
-        if nutrition_context:
+        greeting_mode = is_short_greeting(text)
+        use_retrieval = has_nutrition_intent(text)
+        nutrition_context = build_nutrition_context(text, limit=4) if use_retrieval else ""
+
+        if use_retrieval and nutrition_context:
             final_question = (
                 f"{text}\n\n"
                 f"{nutrition_context}\n"
                 "Khi tra loi, uu tien su dung du lieu noi bo o tren neu lien quan."
             )
+        elif use_retrieval:
+            final_question = text
+        else:
+            final_question = (
+                f"Nguoi dung vua nhan: {text}. "
+                "Hay tra loi ngắn gon, tu nhien bang tieng Viet, khong trich dan URL, khong dua tai lieu hoc thuat."
+            )
 
-        result = chain({"question": final_question})
-        answer = result.get("answer", "Xin lỗi, tôi chưa có câu trả lời phù hợp.")
+        final_question = final_question[:1200]
+
+        def call_chain(payload_question: str, skip_retrieval: bool):
+            return chain({"question": payload_question, "skip_retrieval": skip_retrieval})
+
+        try:
+            result = call_chain(final_question, (not use_retrieval))
+            answer = str(result.get("answer", "")).strip()
+        except Exception as first_exc:
+            msg = str(first_exc).lower()
+            if ("max_length" in msg) or ("input length" in msg) or ("indexing errors" in msg):
+                compact_question = (
+                    f"Tra loi bang tieng Viet, toi da 2 cau, khong URL. Cau hoi: {text}"
+                )[:260]
+                result = call_chain(compact_question, True)
+                answer = str(result.get("answer", "")).strip()
+            else:
+                raise
+
+        if not answer or looks_low_quality_answer(text, answer):
+            feedback_summary = build_feedback_loop_summary()
+            strict_tone = ""
+            if feedback_summary.get("greeting_down_rate", 0.0) >= 0.3:
+                strict_tone = " Tra loi rat ngan gon (toi da 2 cau)."
+
+            retry_question = (
+                f"Người dùng hỏi: {text}. "
+                "Hãy trả lời ngắn gọn, rõ ràng bằng tiếng Việt trong 1-3 câu."
+                " Không trích URL, không đưa tài liệu học thuật không liên quan."
+                f"{strict_tone}"
+            )
+            retry_result = chain({"question": retry_question[:600], "skip_retrieval": True})
+            answer = str(retry_result.get("answer", "")).strip()
+
+        if greeting_mode and (not answer or looks_low_quality_answer(text, answer) or len(answer) > 180):
+            greeting_retry = (
+                "Người dùng vừa chào. "
+                "Hãy chào lại bằng tiếng Việt có dấu trong 1 câu dưới 20 từ, thân thiện, không ký tự lạ."
+            )
+            gr = chain({"question": greeting_retry, "skip_retrieval": True})
+            answer = str(gr.get("answer", "")).strip()
+
+        if looks_unaccented_vietnamese(answer):
+            rewrite_q = (
+                "Hãy viết lại câu sau bằng tiếng Việt có dấu, giữ nguyên nghĩa, ngắn gọn và tự nhiên:\n"
+                f"{answer[:300]}"
+            )
+            rewritten = chain({"question": rewrite_q, "skip_retrieval": True})
+            rewritten_answer = str(rewritten.get("answer", "")).strip()
+            if rewritten_answer:
+                answer = rewritten_answer
+
+        if greeting_mode and (not answer or looks_low_quality_answer(text, answer) or len(answer) > 180):
+            answer = "Chào bạn! Mình là NutriBot, bạn muốn mình hỗ trợ calories hay thực đơn hôm nay?"
+
+        if not answer:
+            return {
+                "ok": False,
+                "answer": "AI local da xu ly nhung chua tao duoc cau tra loi ro rang. Vui long thu lai voi cau hoi cu the hon.",
+                "source": "local_ai",
+            }
+
         return {"ok": True, "answer": answer, "source": "local_ai"}
     except Exception as exc:
         return {"ok": False, "answer": f"Lỗi xử lý AI local: {exc}", "source": "local_ai"}
@@ -247,6 +436,16 @@ def append_feedback(payload: dict):
     with FEEDBACK_LOCK:
         with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        summary = build_feedback_loop_summary()
+        FEEDBACK_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FEEDBACK_REPORT_PATH.write_text(
+            json.dumps({
+                "updated_at": int(time.time()),
+                "summary": summary,
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 def resolve_fpt_project_dir() -> Optional[Path]:
     candidates = [
@@ -329,12 +528,15 @@ class SilentStaticHandler(SimpleHTTPRequestHandler):
 
     def _send_json(self, payload: dict, status: int = 200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def _read_json_body(self):
         try:
@@ -348,6 +550,15 @@ class SilentStaticHandler(SimpleHTTPRequestHandler):
             return {}
 
     def do_POST(self):
+        if self.path == "/api/warmup":
+            state = ensure_models_loaded()
+            self._send_json({
+                "ok": bool(state.get("ready")),
+                "ready": bool(state.get("ready")),
+                "error": state.get("error", ""),
+            })
+            return
+
         if self.path == "/api/local-chat":
             payload = self._read_json_body()
             user_text = payload.get("message", "")
@@ -398,6 +609,7 @@ def ensure_static_server(build_dir: Path) -> tuple[Optional[str], str]:
 
 # ================= STREAMLIT MULTI-COLUMN LAYOUT =================
 st.set_page_config(page_title="Nutrious Consultant", layout="wide")
+start_model_preload_once()
 
 if not os.environ.get("STREAMLIT_SERVER_FILE_WATCHER_TYPE"):
     os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"

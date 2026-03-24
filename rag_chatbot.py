@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from pathlib import Path
+import torch
 
 # ── Rich cho giao diện terminal đẹp ─────────────────────────────────────────
 from rich.console import Console
@@ -67,12 +68,17 @@ CONFIG = {
 
     # ===== Local HuggingFace (không cần Ollama) =====
     "weight_dir": "./weight",
-    "hf_llm_model_id": "Qwen/Qwen2.5-1.5B-Instruct",
-    "hf_llm_local_dir": "./weight/llm/qwen2.5-1.5b-instruct",
+    "hf_llm_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+    "hf_llm_local_dir": "./weight/llm/qwen2.5-0.5b-instruct",
+    "hf_llm_fallback_local_dir": "./weight/llm/flan-t5-small",
     "hf_embed_model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "hf_embed_local_dir": "./weight/embeddings/paraphrase-multilingual-minilm-l12-v2",
     "hf_max_new_tokens": 256,
 }
+
+
+def get_runtime_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def check_ollama():
@@ -162,7 +168,7 @@ def build_vectorstore(force_rebuild: bool = False):
 
         embeddings = HuggingFaceEmbeddings(
             model_name=str(embed_dir),
-            model_kwargs={"device": "cpu", "local_files_only": True},
+            model_kwargs={"device": get_runtime_device(), "local_files_only": True},
             encode_kwargs={"normalize_embeddings": True},
         )
 
@@ -236,29 +242,90 @@ def build_rag_chain(vectorstore):
             temperature=0.1,
         )
     else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForSeq2SeqLM,
+            AutoTokenizer,
+            pipeline,
+        )
         from langchain_huggingface import HuggingFacePipeline
 
-        llm_dir = Path(CONFIG["hf_llm_local_dir"])
-        if not llm_dir.exists():
+        candidate_dirs = [
+            Path(CONFIG["hf_llm_local_dir"]),
+            Path(CONFIG.get("hf_llm_fallback_local_dir", "")),
+        ]
+        candidate_dirs = [d for d in candidate_dirs if str(d) and d.exists()]
+
+        if not candidate_dirs:
             raise RuntimeError(
                 "Thiếu local LLM weights. Hãy chạy: "
                 "python script_download/download_local_weights.py"
             )
 
-        tokenizer = AutoTokenizer.from_pretrained(str(llm_dir), local_files_only=True)
-        model = AutoModelForCausalLM.from_pretrained(str(llm_dir), local_files_only=True)
-        generator = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=CONFIG["hf_max_new_tokens"],
-            do_sample=True,
-            temperature=0.2,
-            top_p=0.9,
-            repetition_penalty=1.1,
-            return_full_text=False,
-        )
+        last_error = None
+        generator = None
+        for llm_dir in candidate_dirs:
+            try:
+                runtime_device = get_runtime_device()
+                model_dtype = torch.float16 if runtime_device == "cuda" else torch.float32
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(llm_dir),
+                    local_files_only=True,
+                    model_max_length=512,
+                    truncation_side="right",
+                )
+                model_config = AutoConfig.from_pretrained(str(llm_dir), local_files_only=True)
+
+                if getattr(model_config, "is_encoder_decoder", False):
+                    model = AutoModelForSeq2SeqLM.from_pretrained(
+                        str(llm_dir),
+                        local_files_only=True,
+                        low_cpu_mem_usage=True,
+                        torch_dtype=model_dtype,
+                    )
+                    if runtime_device == "cuda":
+                        model = model.to("cuda")
+                    generator = pipeline(
+                        "text2text-generation",
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=0 if runtime_device == "cuda" else -1,
+                        truncation=True,
+                        max_new_tokens=CONFIG["hf_max_new_tokens"],
+                        do_sample=False,
+                    )
+                else:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        str(llm_dir),
+                        local_files_only=True,
+                        low_cpu_mem_usage=True,
+                        torch_dtype=model_dtype,
+                    )
+                    if runtime_device == "cuda":
+                        model = model.to("cuda")
+                    generator = pipeline(
+                        "text-generation",
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=0 if runtime_device == "cuda" else -1,
+                        truncation=True,
+                        max_new_tokens=CONFIG["hf_max_new_tokens"],
+                        do_sample=True,
+                        temperature=0.3,
+                        top_p=0.9,
+                        repetition_penalty=1.08,
+                        return_full_text=False,
+                    )
+                console.print(f"[green]Using local LLM:[/green] {llm_dir} [dim](device={runtime_device})[/dim]")
+                break
+            except Exception as exc:
+                last_error = exc
+                generator = None
+
+        if generator is None:
+            raise RuntimeError(f"Không load được local LLM: {last_error}")
         llm = HuggingFacePipeline(pipeline=generator)
 
     retriever = vectorstore.as_retriever(
@@ -270,6 +337,7 @@ def build_rag_chain(vectorstore):
         ("system", """Bạn là trợ lý AI hữu ích. Hãy trả lời câu hỏi dựa trên ngữ cảnh được cung cấp.
 Nếu ngữ cảnh không đủ thông tin, hãy nói rõ và trả lời dựa trên kiến thức của bạn.
 Trả lời ngắn gọn, rõ ràng và chính xác. Ưu tiên dùng tiếng Việt nếu câu hỏi bằng tiếng Việt.
+Nếu người dùng chỉ chào hỏi ngắn (ví dụ: hi, hello, xin chào), hãy chào lại ngắn gọn bằng tiếng Việt rồi hỏi nhu cầu dinh dưỡng cụ thể.
 
 Ngữ cảnh:
 {context}"""),
@@ -281,17 +349,30 @@ Ngữ cảnh:
     chat_history = []
 
     def format_docs(docs):
-        return "\n\n".join(d.page_content for d in docs)
+        combined = "\n\n".join(d.page_content for d in docs)
+        # flan-t5-small has limited input window, keep context concise.
+        return combined[:380]
 
     def invoke(inputs: dict):
         question = inputs["question"]
+        skip_retrieval = bool(inputs.get("skip_retrieval", False))
 
-        # Retrieve
-        source_docs = retriever.invoke(question)
-        context = format_docs(source_docs)
+        # Retrieve (optional for greetings/smalltalk)
+        if skip_retrieval:
+            source_docs = []
+            context = ""
+        else:
+            source_docs = retriever.invoke(question)
+            context = format_docs(source_docs)
 
-        # Giới hạn 5 lượt gần nhất (k=5 → 10 messages)
-        recent_history = chat_history[-10:]
+        # Local small models are fragile with long prompts; keep history minimal.
+        if CONFIG.get("llm_backend") == "local_hf":
+            recent_history = []
+        else:
+            recent_history = chat_history[-4:]
+
+        if len(question) > 220:
+            question = question[:220]
 
         # Generate
         response = (prompt | llm | StrOutputParser()).invoke({
@@ -300,9 +381,9 @@ Ngữ cảnh:
             "question": question,
         })
 
-        # Cập nhật history
-        chat_history.append(HumanMessage(content=question))
-        chat_history.append(AIMessage(content=response))
+        # Cập nhật history (truncate to avoid future context bloat)
+        chat_history.append(HumanMessage(content=question[:220]))
+        chat_history.append(AIMessage(content=str(response)[:260]))
 
         return {"answer": response, "source_documents": source_docs}
 

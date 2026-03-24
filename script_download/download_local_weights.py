@@ -29,12 +29,12 @@ def main():
     )
     parser.add_argument(
         "--llm_repo",
-        default="Qwen/Qwen2.5-1.5B-Instruct",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Hugging Face repo for causal LLM",
     )
     parser.add_argument(
         "--llm_dir",
-        default="weight/llm/qwen2.5-1.5b-instruct",
+        default="weight/llm/qwen2.5-0.5b-instruct",
         help="Local directory to save LLM weights",
     )
     parser.add_argument(
