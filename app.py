@@ -48,6 +48,9 @@ PROMPT_LEAK_MARKERS = (
     "assistant:",
     "duyet:",
     "xem trang web",
+    "meta-instruction",
+    "cau hoi:",
+    "tra loi:",
 )
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -106,6 +109,13 @@ def has_nutrition_intent(text: str) -> bool:
     )
 
 
+def has_body_metric_signal(text: str) -> bool:
+    t = normalize_food_name(text)
+    if not t:
+        return False
+    return bool(re.search(r"\b\d{2,3}\s*kg\b", t) or re.search(r"\b1[.,]\d{1,2}\s*m\b", t) or re.search(r"\bcm\b", t))
+
+
 def looks_low_quality_answer(question: str, answer: str) -> bool:
     q = normalize_food_name(question)
     a = (answer or "").strip()
@@ -128,6 +138,14 @@ def looks_low_quality_answer(question: str, answer: str) -> bool:
     if q in {"hi", "hello", "hey", "xin chao", "chao"} and len(a) > 180:
         return True
 
+    if has_body_metric_signal(question):
+        informative_tokens = ("bmi", "kcal", "calo", "chi so", "muc tieu", "thuc don")
+        if not any(tok in a_lower for tok in informative_tokens):
+            return True
+
+    if ("ke hoach" in q) and not any(tok in a_lower for tok in ("ngay", "tuan", "buoc", "muc tieu", "calo", "kcal")):
+        return True
+
     return False
 
 
@@ -141,23 +159,6 @@ def looks_unaccented_vietnamese(answer: str) -> bool:
     has_plain_marker = any(m in f" {lower} " for m in vietnamese_plain_markers)
     has_diacritic = bool(re.search(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", lower))
     return has_plain_marker and not has_diacritic
-
-
-def build_safe_fallback_answer(question: str) -> str:
-    q = normalize_food_name(question)
-    if is_short_greeting(question):
-        return "Chào bạn! Mình là NutriBot, bạn muốn mình tư vấn calories hay thực đơn hôm nay?"
-
-    if "uc ga" in q and ("protein" in q or "calo" in q or "kcal" in q):
-        return "100g ức gà chín thường có khoảng 31g protein và 160-170 kcal. Bạn muốn mình tính theo khẩu phần bạn đang ăn không?"
-
-    if "giam" in q and ("can" in q or "mo" in q):
-        return (
-            "Bạn có thể giảm 0.5kg mỗi tuần bằng cách giảm 300-500 kcal/ngày, ăn đủ protein và tập 30-45 phút/ngày. "
-            "Nếu muốn, mình sẽ lên thực đơn 7 ngày theo cân nặng và mục tiêu của bạn."
-        )
-
-    return "Mình đã hiểu câu hỏi của bạn. Bạn cho mình thêm mục tiêu cân nặng, chiều cao và mức vận động để mình tư vấn chính xác hơn nhé."
 
 
 def sanitize_answer_text(question: str, answer: str) -> str:
@@ -189,6 +190,36 @@ def sanitize_answer_text(question: str, answer: str) -> str:
 
     text = "\n".join(cleaned_lines).strip()
     text = re.sub(r"\s+", " ", text).strip()
+
+    text = re.sub(r"^\s*[,.;:!?-]+\s*", "", text)
+    text = re.sub(r"\bNguoi dung:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bNgười dùng:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bAI:\s*", "", text, flags=re.IGNORECASE)
+
+    # Keep only the final answer section if model echoes instruction wrappers.
+    for marker in ("Câu trả lời cuối cùng:", "Cau tra loi cuoi cung:"):
+        pos = text.find(marker)
+        if pos >= 0:
+            text = text[pos + len(marker):].strip()
+
+    text = re.sub(r"không lặp lại chỉ dẫn hệ thống\.?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"không hướng dẫn hệ thống\.?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"chỉ trả lời câu cuối cùng cho người dùng\.?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"không trích dẫn tin nhắn trước đó\.?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"không meta-instruction\.?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    sentence_parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    dedup_sentences = []
+    seen_sentence = set()
+    for sent in sentence_parts:
+        key = normalize_food_name(sent)
+        if not key or key in seen_sentence:
+            continue
+        seen_sentence.add(key)
+        dedup_sentences.append(sent)
+    if dedup_sentences:
+        text = " ".join(dedup_sentences).strip()
 
     # Fix truncated/garbled prefix patterns like "ột mốc. Có thể bạn..." by cutting to
     # the first coherent Vietnamese sentence starter when present.
@@ -228,6 +259,9 @@ def looks_noisy_answer(question: str, answer: str) -> bool:
             return True
 
     if looks_low_quality_answer(question, text):
+        return True
+
+    if text.lower().startswith("câu hỏi") or text.lower().startswith("cau hoi"):
         return True
 
     return False
@@ -349,14 +383,6 @@ def build_nutrition_context(question: str, limit: int = 10) -> str:
         if key and key in normalized_q:
             matched.append(info)
 
-    has_nutrition_intent = any(
-        token in normalized_q
-        for token in ("calo", "calories", "protein", "carb", "fat", "beo", "thuc don", "mon an", "giam can", "tang can")
-    )
-
-    if not matched and has_nutrition_intent:
-        matched = list(nutrition_db.values())[:limit]
-
     if not matched:
         return ""
 
@@ -368,76 +394,36 @@ def build_nutrition_context(question: str, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-def try_rule_based_answer(question: str) -> str:
-    q = normalize_food_name(question)
-
-    if is_short_greeting(question):
-        return "Chào bạn! Mình là NutriBot, bạn muốn mình tư vấn calories hay thực đơn hôm nay?"
-
-    if "uc ga" in q and ("protein" in q or "calo" in q or "kcal" in q):
-        nutrition_db = load_nutrition_db_from_dashboard()
-        uc_ga = None
-        for key, info in nutrition_db.items():
-            if "uc ga" in key:
-                uc_ga = info
-                break
-
-        if uc_ga:
-            return (
-                f"100g {uc_ga['name']} có khoảng {uc_ga['protein']:.1f}g protein và {uc_ga['calories']:.0f} kcal. "
-                "Bạn muốn mình quy đổi theo khẩu phần bạn ăn mỗi bữa không?"
-            )
-
-        return "100g ức gà chín thường có khoảng 31g protein và 160-170 kcal. Bạn muốn mình tính theo khẩu phần thực tế của bạn không?"
-
-    if "vach ke hoach giam can" in q or ("giam can" in q and "1 thang" in q):
-        return (
-            "Kế hoạch giảm cân 1 tháng an toàn: mục tiêu giảm 2-3kg, thâm hụt 300-500 kcal/ngày. "
-            "Mỗi ngày ăn đủ protein (1.4-1.8g/kg), ưu tiên thực phẩm tươi, đi bộ hoặc tập 30-45 phút và ngủ 7-8 tiếng. "
-            "Nếu muốn, mình sẽ lên lịch ăn và tập chi tiết theo cân nặng hiện tại của bạn."
-        )
-
-    if (
-        ("tu van" in q and ("calo" in q or "kcal" in q) and "hom nay" in q)
-        or (("calo" in q or "kcal" in q) and "ngay hom nay" in q)
-        or (("calo" in q or "kcal" in q) and "hom nay" in q)
-        or (("calo" in q or "kcal" in q) and "trong ngay" in q)
-    ):
-        return (
-            "Hôm nay bạn nên bắt đầu với mục tiêu 1600-1800 kcal nếu đang muốn giảm mỡ nhẹ. "
-            "Chia 3 bữa chính + 1 bữa phụ, ưu tiên đủ protein (khoảng 1.4-1.8g/kg cân nặng), rau xanh và uống đủ nước. "
-            "Nếu bạn gửi cân nặng và chiều cao, mình sẽ chốt con số kcal chính xác hơn cho riêng bạn."
-        )
-
-    if ("thuc don" in q and ("giam mo" in q or "giam can" in q)) or ("goi y" in q and "1 ngay" in q):
-        return (
-            "Thực đơn 1 ngày để giảm mỡ (mẫu): sáng yến mạch + 2 trứng; trưa 150g ức gà + rau + 1/2 chén cơm; "
-            "xế 1 hũ sữa chua không đường; tối cá/đậu phụ + salad + khoai lang nhỏ. "
-            "Mục tiêu khoảng 1600-1800 kcal và đủ 110-130g protein/ngày."
-        )
-
-    return ""
-
-
 def load_rag_and_models():
     q_filter_instance = None
     model_path = BASE_DIR / "weight" / "question_filter_model.pkl"
     if model_path.exists():
         q_filter_instance = QuestionFilter(model_path=str(model_path))
 
-    if check_ollama():
-        vs = build_vectorstore(force_rebuild=False)
-        chain = build_rag_chain(vs)
-        return q_filter_instance, chain, True, ""
+    preferred_backend = str(CONFIG.get("llm_backend", "local_hf")).lower()
+    candidates = [preferred_backend] + [b for b in ("local_hf", "ollama") if b != preferred_backend]
 
-    if CONFIG.get("llm_backend") == "ollama":
-        return q_filter_instance, None, False, "Ollama chưa chạy hoặc chưa sẵn sàng."
+    errors = []
+    for backend in candidates:
+        try:
+            CONFIG["llm_backend"] = backend
+
+            # For ollama, skip quickly if server isn't reachable.
+            if backend == "ollama" and not check_ollama():
+                errors.append("ollama: server không sẵn sàng")
+                continue
+
+            vs = build_vectorstore(force_rebuild=False)
+            chain = build_rag_chain(vs)
+            return q_filter_instance, chain, True, ""
+        except Exception as exc:
+            errors.append(f"{backend}: {exc}")
 
     return (
         q_filter_instance,
         None,
         False,
-        "Thiếu local weights hoặc model local chưa sẵn sàng.",
+        "Không khởi tạo được backend model. " + " | ".join(errors),
     )
 
 
@@ -496,13 +482,15 @@ def run_local_chat_query(user_text: str) -> dict:
     # Keep prompt compact for small local models.
     text = text[:320]
 
-    rule_answer = try_rule_based_answer(text)
-    if rule_answer:
-        return {"ok": True, "answer": rule_answer, "source": "local_rule"}
-
     state = ensure_models_loaded()
     q_filter_instance = state.get("q_filter")
     chain = state.get("rag_chain")
+
+    if not state.get("ready") or chain is None:
+        # Auto-retry once to recover from transient init errors.
+        state = ensure_models_loaded(force_reload=True)
+        q_filter_instance = state.get("q_filter")
+        chain = state.get("rag_chain")
 
     if not state.get("ready") or chain is None:
         detail = state.get("error") or "Model chưa sẵn sàng."
@@ -525,9 +513,10 @@ def run_local_chat_query(user_text: str) -> dict:
             pass
 
     try:
+        last_raw_answer = ""
         greeting_mode = is_short_greeting(text)
-        use_retrieval = has_nutrition_intent(text)
-        nutrition_context = build_nutrition_context(text, limit=4) if use_retrieval else ""
+        nutrition_context = build_nutrition_context(text, limit=4) if has_nutrition_intent(text) else ""
+        use_retrieval = bool(nutrition_context)
 
         if use_retrieval and nutrition_context:
             final_question = (
@@ -539,8 +528,11 @@ def run_local_chat_query(user_text: str) -> dict:
             final_question = text
         else:
             final_question = (
-                f"Nguoi dung vua nhan: {text}. "
-                "Hay tra loi ngắn gon, tu nhien bang tieng Viet, khong trich dan URL, khong dua tai lieu hoc thuat."
+                "Đây là tin nhắn mới nhất của người dùng trong cuộc hội thoại. "
+                "Nếu đây là thông tin bổ sung (ví dụ cân nặng/chiều cao), hãy nối tiếp theo ngữ cảnh trước đó. "
+                "Nếu tin nhắn chủ yếu là số đo cơ thể, hãy ước tính BMI sơ bộ và gợi ý mức kcal/ngày phù hợp. "
+                "Trả lời bằng tiếng Việt tự nhiên, ngắn gọn, không lặp, không URL, không meta-instruction. "
+                f"Tin nhắn người dùng: {text}"
             )
 
         final_question = final_question[:1200]
@@ -551,6 +543,7 @@ def run_local_chat_query(user_text: str) -> dict:
         try:
             result = call_chain(final_question, (not use_retrieval))
             answer = str(result.get("answer", "")).strip()
+            last_raw_answer = answer
         except Exception as first_exc:
             msg = str(first_exc).lower()
             if ("max_length" in msg) or ("input length" in msg) or ("indexing errors" in msg):
@@ -559,6 +552,7 @@ def run_local_chat_query(user_text: str) -> dict:
                 )[:260]
                 result = call_chain(compact_question, True)
                 answer = str(result.get("answer", "")).strip()
+                last_raw_answer = answer
             else:
                 raise
 
@@ -575,12 +569,15 @@ def run_local_chat_query(user_text: str) -> dict:
                 "Hãy trả lời ngắn gọn, rõ ràng bằng tiếng Việt trong 1-3 câu."
                 " Chỉ trả về câu trả lời cuối cùng cho người dùng."
                 " Không trích URL, không đưa hướng dẫn hệ thống, không lặp câu."
+                " Không bịa hội thoại hoặc lịch sử người dùng nếu không có dữ liệu."
                 f"{strict_tone}"
             )
 
-            for _ in range(2):
+            for _ in range(1):
                 retry_result = chain({"question": retry_question[:600], "skip_retrieval": True})
-                answer = sanitize_answer_text(text, str(retry_result.get("answer", "")).strip())
+                raw_retry = str(retry_result.get("answer", "")).strip()
+                last_raw_answer = raw_retry or last_raw_answer
+                answer = sanitize_answer_text(text, raw_retry)
                 if not looks_noisy_answer(text, answer):
                     break
 
@@ -590,7 +587,9 @@ def run_local_chat_query(user_text: str) -> dict:
                 "Hãy chào lại bằng tiếng Việt có dấu trong 1 câu dưới 20 từ, thân thiện, không ký tự lạ."
             )
             gr = chain({"question": greeting_retry, "skip_retrieval": True})
-            answer = sanitize_answer_text(text, str(gr.get("answer", "")).strip())
+            raw_gr = str(gr.get("answer", "")).strip()
+            last_raw_answer = raw_gr or last_raw_answer
+            answer = sanitize_answer_text(text, raw_gr)
 
         if looks_unaccented_vietnamese(answer):
             rewrite_q = (
@@ -598,20 +597,43 @@ def run_local_chat_query(user_text: str) -> dict:
                 f"{answer[:300]}"
             )
             rewritten = chain({"question": rewrite_q, "skip_retrieval": True})
-            rewritten_answer = sanitize_answer_text(text, str(rewritten.get("answer", "")).strip())
+            raw_rewrite = str(rewritten.get("answer", "")).strip()
+            last_raw_answer = raw_rewrite or last_raw_answer
+            rewritten_answer = sanitize_answer_text(text, raw_rewrite)
             if rewritten_answer:
                 answer = rewritten_answer
 
-        if greeting_mode and (not answer or looks_noisy_answer(text, answer) or len(answer) > 180):
-            answer = build_safe_fallback_answer(text)
+        if not answer or looks_noisy_answer(text, answer):
+            final_retry_q = (
+                f"Câu hỏi: {text}\n"
+                "Trả lời trực tiếp bằng tiếng Việt trong 2-4 câu, không lặp, không trích URL, không meta-instruction."
+                " Không bịa thông tin lịch sử hội thoại."
+            )
+            final_retry = chain({"question": final_retry_q[:600], "skip_retrieval": True})
+            raw_final_retry = str(final_retry.get("answer", "")).strip()
+            last_raw_answer = raw_final_retry or last_raw_answer
+            answer = sanitize_answer_text(text, raw_final_retry)
 
-        if looks_noisy_answer(text, answer):
-            answer = build_safe_fallback_answer(text)
+        if answer and looks_noisy_answer(text, answer):
+            rewrite_q = (
+                f"Người dùng hỏi: {text}\n"
+                f"Bản nháp có lỗi: {answer[:380]}\n"
+                "Hãy viết lại một câu trả lời sạch bằng tiếng Việt tự nhiên trong 2-3 câu."
+                " Không thêm lịch sử hội thoại nếu người dùng chưa cung cấp."
+            )
+            rewritten = chain({"question": rewrite_q[:700], "skip_retrieval": True})
+            raw_rewritten = str(rewritten.get("answer", "")).strip()
+            last_raw_answer = raw_rewritten or last_raw_answer
+            answer = sanitize_answer_text(text, raw_rewritten)
 
         if not answer:
+            fallback_raw = URL_RE.sub("", (last_raw_answer or "")).strip()
+            fallback_raw = re.sub(r"\s+", " ", fallback_raw)
+            if fallback_raw:
+                return {"ok": True, "answer": fallback_raw[:280], "source": "local_ai"}
             return {
                 "ok": False,
-                "answer": "AI local da xu ly nhung chua tao duoc cau tra loi ro rang. Vui long thu lai voi cau hoi cu the hon.",
+                "answer": "AI local đã xử lý nhưng chưa tạo được câu trả lời rõ ràng. Bạn thử diễn đạt cụ thể hơn một chút nhé.",
                 "source": "local_ai",
             }
 

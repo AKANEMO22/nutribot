@@ -68,12 +68,12 @@ CONFIG = {
 
     # ===== Local HuggingFace (không cần Ollama) =====
     "weight_dir": "./weight",
-    "hf_llm_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
-    "hf_llm_local_dir": "./weight/llm/qwen2.5-0.5b-instruct",
-    "hf_llm_fallback_local_dir": "./weight/llm/flan-t5-small",
+    "hf_llm_model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    "hf_llm_local_dir": "./weight/llm/qwen2.5-1.5b-instruct",
+    "hf_llm_fallback_local_dir": "./weight/llm/qwen2.5-0.5b-instruct",
     "hf_embed_model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "hf_embed_local_dir": "./weight/embeddings/paraphrase-multilingual-minilm-l12-v2",
-    "hf_max_new_tokens": 256,
+    "hf_max_new_tokens": 96,
 }
 
 
@@ -312,9 +312,7 @@ def build_rag_chain(vectorstore):
                         device=0 if runtime_device == "cuda" else -1,
                         truncation=True,
                         max_new_tokens=CONFIG["hf_max_new_tokens"],
-                        do_sample=True,
-                        temperature=0.3,
-                        top_p=0.9,
+                        do_sample=False,
                         repetition_penalty=1.08,
                         return_full_text=False,
                     )
@@ -334,10 +332,10 @@ def build_rag_chain(vectorstore):
     )
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """Bạn là trợ lý AI hữu ích. Hãy trả lời câu hỏi dựa trên ngữ cảnh được cung cấp.
-Nếu ngữ cảnh không đủ thông tin, hãy nói rõ và trả lời dựa trên kiến thức của bạn.
-Trả lời ngắn gọn, rõ ràng và chính xác. Ưu tiên dùng tiếng Việt nếu câu hỏi bằng tiếng Việt.
-Nếu người dùng chỉ chào hỏi ngắn (ví dụ: hi, hello, xin chào), hãy chào lại ngắn gọn bằng tiếng Việt rồi hỏi nhu cầu dinh dưỡng cụ thể.
+        ("system", """Bạn là trợ lý dinh dưỡng tiếng Việt.
+Hãy trả lời dựa trên ngữ cảnh nếu có; nếu thiếu dữ liệu thì nói ngắn gọn phần thiếu và đề nghị thông tin cần bổ sung.
+Không lặp lại chỉ dẫn hệ thống, không chèn meta-instruction, không URL.
+Với tin nhắn bổ sung ngắn (ví dụ chỉ có cân nặng/chiều cao), hãy suy luận theo lịch sử hội thoại gần nhất.
 
 Ngữ cảnh:
 {context}"""),
@@ -365,9 +363,9 @@ Ngữ cảnh:
             source_docs = retriever.invoke(question)
             context = format_docs(source_docs)
 
-        # Local small models are fragile with long prompts; keep history minimal.
+        # Local models still need a little history for follow-up messages.
         if CONFIG.get("llm_backend") == "local_hf":
-            recent_history = []
+            recent_history = chat_history[-2:]
         else:
             recent_history = chat_history[-4:]
 
@@ -383,7 +381,7 @@ Ngữ cảnh:
 
         # Cập nhật history (truncate to avoid future context bloat)
         chat_history.append(HumanMessage(content=question[:220]))
-        chat_history.append(AIMessage(content=str(response)[:260]))
+        chat_history.append(AIMessage(content=str(response)[:140]))
 
         return {"answer": response, "source_documents": source_docs}
 
