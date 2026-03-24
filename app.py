@@ -1,9 +1,11 @@
+import os
 from pathlib import Path
 import re
 import shutil
 import socket
 import subprocess
 import threading
+import json
 from typing import Optional
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,139 @@ BASE_DIR = Path(__file__).resolve().parent
 FPT_PROJECT_NAME = "FPT University Portal Redesign"
 EMBEDDED_BUILD_DIR = BASE_DIR / "streamlit_assets" / "embedded_fpt_build"       
 STATIC_SERVER = {"server": None, "thread": None, "port": None}
+FEEDBACK_LOG_PATH = BASE_DIR / "data" / "chat_feedback.jsonl"
+FEEDBACK_LOCK = threading.Lock()
+MODEL_LOCK = threading.Lock()
+MODEL_STATE = {
+    "initialized": False,
+    "q_filter": None,
+    "rag_chain": None,
+    "ready": False,
+    "error": "",
+}
+
+
+def is_simple_greeting(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return normalized in {
+        "hi",
+        "hello",
+        "hey",
+        "xin chao",
+        "xin chào",
+        "chao",
+        "chào",
+    }
+
+
+def load_rag_and_models():
+    q_filter_instance = None
+    model_path = BASE_DIR / "weight" / "question_filter_model.pkl"
+    if model_path.exists():
+        q_filter_instance = QuestionFilter(model_path=str(model_path))
+
+    if check_ollama():
+        vs = build_vectorstore(force_rebuild=False)
+        chain = build_rag_chain(vs)
+        return q_filter_instance, chain, True, ""
+
+    if CONFIG.get("llm_backend") == "ollama":
+        return q_filter_instance, None, False, "Ollama chưa chạy hoặc chưa sẵn sàng."
+
+    return (
+        q_filter_instance,
+        None,
+        False,
+        "Thiếu local weights hoặc model local chưa sẵn sàng.",
+    )
+
+
+def ensure_models_loaded(force_reload: bool = False):
+    with MODEL_LOCK:
+        if MODEL_STATE["initialized"] and not force_reload:
+            return MODEL_STATE
+
+        try:
+            q_filter_instance, chain, ready, err = load_rag_and_models()
+            MODEL_STATE.update(
+                {
+                    "initialized": True,
+                    "q_filter": q_filter_instance,
+                    "rag_chain": chain,
+                    "ready": ready,
+                    "error": err,
+                }
+            )
+        except Exception as exc:
+            MODEL_STATE.update(
+                {
+                    "initialized": True,
+                    "q_filter": None,
+                    "rag_chain": None,
+                    "ready": False,
+                    "error": f"Lỗi khởi tạo model: {exc}",
+                }
+            )
+
+        return MODEL_STATE
+
+
+def run_local_chat_query(user_text: str) -> dict:
+    text = (user_text or "").strip()
+    if not text:
+        return {"ok": False, "answer": "Vui lòng nhập câu hỏi."}
+
+    if is_simple_greeting(text):
+        return {
+            "ok": True,
+            "answer": "Chào bạn! Mình là NutriBot AI local. Bạn có thể hỏi về calories, protein, thực đơn hoặc phân tích bữa ăn.",
+            "source": "local_ai",
+        }
+
+    state = ensure_models_loaded()
+    q_filter_instance = state.get("q_filter")
+    chain = state.get("rag_chain")
+
+    if not state.get("ready") or chain is None:
+        detail = state.get("error") or "Model chưa sẵn sàng."
+        return {
+            "ok": False,
+            "answer": f"Hệ thống AI local chưa sẵn sàng. {detail}",
+            "source": "local_ai",
+        }
+
+    if q_filter_instance:
+        try:
+            if q_filter_instance.is_dangerous(text):
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "answer": "⚠️ Câu hỏi bị chặn bởi bộ lọc an toàn.",
+                    "source": "local_ai",
+                }
+        except Exception:
+            pass
+
+    try:
+        result = chain({"question": text})
+        answer = result.get("answer", "Xin lỗi, tôi chưa có câu trả lời phù hợp.")
+        return {"ok": True, "answer": answer, "source": "local_ai"}
+    except Exception as exc:
+        return {"ok": False, "answer": f"Lỗi xử lý AI local: {exc}", "source": "local_ai"}
+
+
+def append_feedback(payload: dict):
+    FEEDBACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": int(time.time()),
+        "question": str(payload.get("question", ""))[:2000],
+        "answer": str(payload.get("answer", ""))[:5000],
+        "rating": str(payload.get("rating", ""))[:16],
+        "source": str(payload.get("source", "iframe"))[:64],
+    }
+    with FEEDBACK_LOCK:
+        with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def resolve_fpt_project_dir() -> Optional[Path]:
     candidates = [
@@ -100,6 +235,46 @@ class SilentStaticHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def _send_json(self, payload: dict, status: int = 200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+
+    def do_POST(self):
+        if self.path == "/api/local-chat":
+            payload = self._read_json_body()
+            user_text = payload.get("message", "")
+            result = run_local_chat_query(user_text)
+            status = 200 if result.get("ok") else 400
+            self._send_json(result, status=status)
+            return
+
+        if self.path == "/api/feedback":
+            payload = self._read_json_body()
+            try:
+                append_feedback(payload)
+                self._send_json({"ok": True})
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+
+        self._send_json({"ok": False, "error": "Not Found"}, status=404)
+
     def end_headers(self):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
@@ -132,23 +307,8 @@ def ensure_static_server(build_dir: Path) -> tuple[Optional[str], str]:
 # ================= STREAMLIT MULTI-COLUMN LAYOUT =================
 st.set_page_config(page_title="Nutrious Consultant", layout="wide")
 
-# Khởi tạo RAG và Model ở Cache để tránh load lại lúc re-render UI
-@st.cache_resource
-def load_rag_and_models():
-    # 1. Khởi tạo Q_Filter
-    q_filter_instance = None
-    if Path("weight/question_filter_model.pkl").exists():
-        q_filter_instance = QuestionFilter(model_path="weight/question_filter_model.pkl")
-    
-    # 2. Khởi tạo RAG Chain
-    if check_ollama():
-        vs = build_vectorstore(force_rebuild=False)
-        chain = build_rag_chain(vs)
-        return q_filter_instance, chain, True
-    else:
-        return q_filter_instance, None, False
-
-q_filter, rag_chain, ollama_ok = load_rag_and_models()
+if not os.environ.get("STREAMLIT_SERVER_FILE_WATCHER_TYPE"):
+    os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 
 build_dir, build_status = resolve_fpt_build_dir()
 server_url, server_status = ensure_static_server(build_dir) if build_dir else (None, "")

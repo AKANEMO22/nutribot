@@ -3,6 +3,7 @@ nbvenv/
 
 # Model artifacts / local runtime data
 weight/*
+weight/**
 !weight/
 !weight/.gitkeep
 models/*.pkl
