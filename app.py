@@ -6,6 +6,7 @@ import socket
 import subprocess
 import threading
 import json
+from collections import OrderedDict
 from typing import Optional
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +36,11 @@ MODEL_STATE = {
 }
 NUTRITION_DB_CACHE = None
 MODEL_PRELOAD_STARTED = False
+FAST_MAX_MODEL_CALLS = int(os.getenv("NUTRIBOT_MAX_MODEL_CALLS", "2"))
+RESPONSE_CACHE_MAX = int(os.getenv("NUTRIBOT_RESPONSE_CACHE_MAX", "256"))
+RESPONSE_CACHE = OrderedDict()
+RESPONSE_CACHE_LOCK = threading.Lock()
+CACHE_VERSION = "v2"
 
 PROMPT_LEAK_MARKERS = (
     "trả lời ngắn gọn",
@@ -58,6 +64,12 @@ PROMPT_LEAK_MARKERS = (
     "không sử dụng meta-instruction",
     "tra loi dai hon",
     "trả lời dài hơn",
+    "tra loi dung trong tam",
+    "trả lời đúng trọng tâm",
+    "khong tu mo rong sang chu de khac",
+    "không tự mở rộng sang chủ đề khác",
+    "sang chu de khac neu nguoi dung khong hoi",
+    "sang chủ đề khác nếu người dùng không hỏi",
 )
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -69,6 +81,12 @@ GREETING_PREFIXES = (
     "xin chao",
     "chao",
 )
+
+FOCUS_STOPWORDS = {
+    "toi", "ban", "minh", "la", "va", "voi", "cho", "cua", "trong", "ngoai", "nhu", "the", "nao",
+    "gi", "sao", "neu", "thi", "mot", "nhung", "nay", "kia", "duoc", "khong", "co", "can", "hay",
+    "please", "help", "the", "and", "for", "you", "are", "is", "to", "of", "in", "on", "a", "an",
+}
 
 
 def is_greeting_like(text: str) -> bool:
@@ -250,6 +268,82 @@ def sanitize_answer_text(question: str, answer: str) -> str:
     return text
 
 
+def sanitize_answer_text_loose(answer: str) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return ""
+
+    text = URL_RE.sub("", text)
+    lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
+
+    kept = []
+    seen = set()
+    for ln in lines:
+        ln_lower = ln.lower()
+        if any(marker in ln_lower for marker in PROMPT_LEAK_MARKERS):
+            continue
+        norm = normalize_food_name(ln)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        kept.append(ln)
+
+    text = " ".join(kept).strip() if kept else text
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\b(Nguoi dung|Người dùng|Assistant|User|System)\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*[,.;:!?-]+\s*", "", text)
+
+    if len(text) > 260:
+        parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        if parts:
+            text = " ".join(parts[:2]).strip()
+        else:
+            text = text[:260].strip()
+
+    return text
+
+
+def finalize_display_answer(answer: str, max_len: int = 320) -> str:
+    text = re.sub(r"\s+", " ", (answer or "").strip())
+    if not text:
+        return ""
+
+    if len(text) > max_len:
+        text = text[:max_len].strip()
+
+    if text and text[-1] not in ".!?":
+        punct_idx = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+        if punct_idx >= 20:
+            text = text[: punct_idx + 1].strip()
+        elif len(text) >= 30:
+            text = text.rstrip(" ,;:-") + "."
+
+    return text
+
+
+def extract_focus_tokens(text: str) -> set[str]:
+    norm = normalize_food_name(text)
+    tokens = re.findall(r"[a-z0-9]+", norm)
+    return {t for t in tokens if len(t) >= 3 and t not in FOCUS_STOPWORDS}
+
+
+def is_off_topic_answer(question: str, answer: str) -> bool:
+    if not question or not answer:
+        return False
+    if is_short_greeting(question):
+        return False
+
+    q_tokens = extract_focus_tokens(question)
+    if not q_tokens:
+        return False
+
+    a_tokens = extract_focus_tokens(answer)
+    overlap = len(q_tokens.intersection(a_tokens))
+
+    # Generic topic check: for contentful questions, at least one shared focus token.
+    return len(q_tokens) >= 2 and overlap == 0
+
+
 def looks_noisy_answer(question: str, answer: str) -> bool:
     text = (answer or "").strip()
     if not text:
@@ -424,9 +518,20 @@ def load_rag_and_models():
                 errors.append("ollama: server không sẵn sàng")
                 continue
 
-            vs = build_vectorstore(force_rebuild=False)
-            chain = build_rag_chain(vs)
-            return q_filter_instance, chain, True, ""
+            # Try full RAG first; if retrieval stack fails, still keep direct-LLM mode.
+            vectorstore = None
+            rag_error = ""
+            try:
+                vectorstore = build_vectorstore(force_rebuild=False)
+            except Exception as exc:
+                rag_error = f"RAG unavailable: {exc}"
+
+            try:
+                chain = build_rag_chain(vectorstore)
+                return q_filter_instance, chain, True, rag_error
+            except Exception as chain_exc:
+                errors.append(f"{backend} chain: {chain_exc}")
+                continue
         except Exception as exc:
             errors.append(f"{backend}: {exc}")
 
@@ -485,6 +590,37 @@ def start_model_preload_once():
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def _cache_key(text: str) -> str:
+    return f"{CACHE_VERSION}:{normalize_food_name((text or '').strip())[:320]}"
+
+
+def get_cached_answer(text: str) -> Optional[str]:
+    key = _cache_key(text)
+    if not key:
+        return None
+    with RESPONSE_CACHE_LOCK:
+        cached = RESPONSE_CACHE.get(key)
+        if cached is None:
+            return None
+        if is_off_topic_answer(text, cached):
+            RESPONSE_CACHE.pop(key, None)
+            return None
+        RESPONSE_CACHE.move_to_end(key)
+        return cached
+
+
+def set_cached_answer(text: str, answer: str) -> None:
+    key = _cache_key(text)
+    clean_answer = (answer or "").strip()
+    if not key or not clean_answer:
+        return
+    with RESPONSE_CACHE_LOCK:
+        RESPONSE_CACHE[key] = clean_answer
+        RESPONSE_CACHE.move_to_end(key)
+        while len(RESPONSE_CACHE) > max(16, RESPONSE_CACHE_MAX):
+            RESPONSE_CACHE.popitem(last=False)
+
+
 def run_local_chat_query(user_text: str) -> dict:
     text = (user_text or "").strip()
     if not text:
@@ -492,6 +628,10 @@ def run_local_chat_query(user_text: str) -> dict:
 
     # Keep prompt compact for small local models.
     text = text[:320]
+
+    cached_answer = get_cached_answer(text)
+    if cached_answer:
+        return {"ok": True, "answer": cached_answer, "source": "local_ai_cache"}
 
     state = ensure_models_loaded()
     q_filter_instance = state.get("q_filter")
@@ -513,7 +653,20 @@ def run_local_chat_query(user_text: str) -> dict:
 
     if q_filter_instance and not should_skip_safety_filter(text):
         try:
-            if q_filter_instance.is_dangerous(text):
+            is_dangerous = bool(q_filter_instance.is_dangerous(text))
+            should_block = is_dangerous
+
+            # Reduce false positives: only hard-block when model is confident enough.
+            pipeline = getattr(q_filter_instance, "pipeline", None)
+            if is_dangerous and pipeline is not None and hasattr(pipeline, "predict_proba"):
+                try:
+                    proba = pipeline.predict_proba([text])[0]
+                    danger_conf = float(proba[1]) if len(proba) > 1 else float(proba[0])
+                    should_block = danger_conf >= float(os.getenv("NUTRIBOT_SAFETY_BLOCK_THRESHOLD", "0.92"))
+                except Exception:
+                    should_block = is_dangerous
+
+            if should_block:
                 return {
                     "ok": False,
                     "blocked": True,
@@ -525,8 +678,7 @@ def run_local_chat_query(user_text: str) -> dict:
 
     try:
         last_raw_answer = ""
-        greeting_mode = is_short_greeting(text)
-        nutrition_context = build_nutrition_context(text, limit=4) if has_nutrition_intent(text) else ""
+        nutrition_context = build_nutrition_context(text, limit=4)
         use_retrieval = bool(nutrition_context)
 
         def call_chain_safe(payload_question: str, skip_retrieval: bool):
@@ -536,93 +688,73 @@ def run_local_chat_query(user_text: str) -> dict:
             except Exception:
                 return ""
 
-        if use_retrieval and nutrition_context:
-            final_question = (
-                f"{text}\n\n"
+        base_prompt = (
+            f"Câu hỏi người dùng: {text}\n"
+            "Trả lời trực tiếp đúng trọng tâm câu hỏi hiện tại bằng tiếng Việt tự nhiên trong 2-4 câu, rõ ràng, không lặp, không URL. "
+            "Không tự chuyển sang chủ đề khác nếu người dùng không hỏi. "
+            "Nếu người dùng chỉ chào ngắn thì chào lại ngắn trong 1 câu. "
+            "Nếu câu hỏi yêu cầu số liệu cụ thể thì trả lời số liệu trực tiếp trước."
+        )
+        if nutrition_context:
+            base_prompt = (
+                f"{base_prompt}\n\n"
                 f"{nutrition_context}\n"
-                "Khi tra loi, uu tien su dung du lieu noi bo o tren neu lien quan."
-            )
-        elif use_retrieval:
-            final_question = text
-        else:
-            final_question = (
-                f"Câu hỏi người dùng: {text}\n"
-                "Trả lời bằng tiếng Việt tự nhiên trong 2-4 câu. "
-                "Nếu đây là số đo cơ thể thì ước tính BMI và gợi ý mức kcal/ngày phù hợp. "
-                "Nếu thiếu dữ liệu thì hỏi thêm thông tin cần thiết."
+                "Nếu dữ liệu nội bộ liên quan thì ưu tiên sử dụng."
             )
 
-        final_question = final_question[:1200]
+        max_calls = max(1, min(3, FAST_MAX_MODEL_CALLS))
+        answer = ""
+        for attempt in range(max_calls):
+            if attempt == 0:
+                payload_question = base_prompt[:1200]
+                skip_retrieval = not use_retrieval
+            else:
+                payload_question = (
+                    f"Câu hỏi: {text}\n"
+                    f"Bản nháp trước đó: {last_raw_answer[:420]}\n"
+                    "Viết lại ngắn gọn, mạch lạc bằng tiếng Việt tự nhiên, chỉ giữ câu trả lời cuối cùng cho người dùng."
+                )[:900]
+                skip_retrieval = True
 
-        answer = call_chain_safe(final_question, (not use_retrieval))
-        last_raw_answer = answer
+            raw = call_chain_safe(payload_question, skip_retrieval)
+            last_raw_answer = raw or last_raw_answer
+            answer = sanitize_answer_text(text, raw)
+            if answer and not looks_noisy_answer(text, answer) and not is_off_topic_answer(text, answer):
+                break
 
-        if not answer:
-            compact_question = (
-                f"Tra loi bang tieng Viet, toi da 3 cau. Cau hoi: {text}"
-            )[:260]
-            answer = call_chain_safe(compact_question, True)
-            last_raw_answer = answer or last_raw_answer
-
-        answer = sanitize_answer_text(text, answer)
-
-        if looks_noisy_answer(text, answer):
-            retry_question = (
-                f"Viết lại câu trả lời cho câu hỏi sau bằng tiếng Việt rõ ràng, không lặp: {text}"
-            )
-            raw_retry = call_chain_safe(retry_question[:600], True)
-            last_raw_answer = raw_retry or last_raw_answer
-            answer = sanitize_answer_text(text, raw_retry)
-
-        if greeting_mode and (not answer or looks_noisy_answer(text, answer) or len(answer) > 180):
-            greeting_retry = (
-                "Người dùng vừa chào. "
-                "Hãy chào lại bằng tiếng Việt có dấu trong 1 câu dưới 20 từ, thân thiện, không ký tự lạ."
-            )
-            raw_gr = call_chain_safe(greeting_retry, True)
-            last_raw_answer = raw_gr or last_raw_answer
-            answer = sanitize_answer_text(text, raw_gr)
-
-        if looks_unaccented_vietnamese(answer):
-            rewrite_q = (
-                "Hãy viết lại câu sau bằng tiếng Việt có dấu, giữ nguyên nghĩa, ngắn gọn và tự nhiên:\n"
-                f"{answer[:300]}"
-            )
-            raw_rewrite = call_chain_safe(rewrite_q, True)
-            last_raw_answer = raw_rewrite or last_raw_answer
-            rewritten_answer = sanitize_answer_text(text, raw_rewrite)
-            if rewritten_answer:
-                answer = rewritten_answer
-
-        if not answer or looks_noisy_answer(text, answer):
-            final_retry_q = (
-                f"Câu hỏi: {text}\n"
-                "Trả lời trực tiếp bằng tiếng Việt trong 2-4 câu, không lặp, không trích URL."
-            )
-            raw_final_retry = call_chain_safe(final_retry_q[:600], True)
-            last_raw_answer = raw_final_retry or last_raw_answer
-            answer = sanitize_answer_text(text, raw_final_retry)
-
-        if answer and looks_noisy_answer(text, answer):
-            rewrite_q = (
-                f"Người dùng hỏi: {text}\n"
-                f"Bản nháp có lỗi: {answer[:380]}\n"
-                "Hãy viết lại một câu trả lời sạch bằng tiếng Việt tự nhiên trong 2-3 câu."
-            )
-            raw_rewritten = call_chain_safe(rewrite_q[:700], True)
-            last_raw_answer = raw_rewritten or last_raw_answer
-            answer = sanitize_answer_text(text, raw_rewritten)
+        if answer and is_off_topic_answer(text, answer):
+            focus_retry_q = (
+                f"Câu hỏi của người dùng: {text}\n"
+                f"Bản nháp đang lệch trọng tâm: {answer[:360]}\n"
+                "Viết lại ngắn gọn, trả lời đúng ý chính của câu hỏi, không thêm nội dung ngoài yêu cầu."
+            )[:900]
+            focus_raw = call_chain_safe(focus_retry_q, True)
+            last_raw_answer = focus_raw or last_raw_answer
+            focus_answer = sanitize_answer_text(text, focus_raw)
+            if focus_answer and not looks_noisy_answer(text, focus_answer):
+                answer = focus_answer
 
         if not answer:
             fallback_answer = sanitize_answer_text(text, last_raw_answer or "")
-            if fallback_answer and not looks_noisy_answer(text, fallback_answer):
-                return {"ok": True, "answer": fallback_answer[:320], "source": "local_ai"}
+            if fallback_answer and not looks_noisy_answer(text, fallback_answer) and not is_off_topic_answer(text, fallback_answer):
+                fallback_answer = finalize_display_answer(fallback_answer, 320)
+                set_cached_answer(text, fallback_answer)
+                return {"ok": True, "answer": fallback_answer, "source": "local_ai"}
+
+            loose_answer = sanitize_answer_text_loose(last_raw_answer or "")
+            if loose_answer:
+                loose_answer = finalize_display_answer(loose_answer, 280)
+                set_cached_answer(text, loose_answer)
+                return {"ok": True, "answer": loose_answer, "source": "local_ai"}
+
             return {
                 "ok": False,
                 "answer": "AI local đã xử lý nhưng chưa tạo được câu trả lời rõ ràng. Bạn thử diễn đạt cụ thể hơn một chút nhé.",
                 "source": "local_ai",
             }
 
+        answer = finalize_display_answer(answer, 320)
+        set_cached_answer(text, answer)
         return {"ok": True, "answer": answer, "source": "local_ai"}
     except Exception as exc:
         return {"ok": False, "answer": f"Lỗi xử lý AI local: {exc}", "source": "local_ai"}

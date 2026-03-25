@@ -57,7 +57,7 @@ CONFIG = {
     "docs_dir": "./documents",
 
     # Số chunk trả về khi tìm kiếm
-    "top_k": 4,
+    "top_k": int(os.getenv("NUTRIBOT_TOP_K", "3")),
 
     # Kích thước chunk (token ≈ ký tự / 4)
     "chunk_size": 500,
@@ -73,7 +73,7 @@ CONFIG = {
     "hf_llm_fallback_local_dir": "./weight/llm/qwen2.5-0.5b-instruct",
     "hf_embed_model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "hf_embed_local_dir": "./weight/embeddings/paraphrase-multilingual-minilm-l12-v2",
-    "hf_max_new_tokens": 96,
+    "hf_max_new_tokens": int(os.getenv("NUTRIBOT_HF_MAX_NEW_TOKENS", "96")),
 }
 
 
@@ -227,7 +227,7 @@ def build_vectorstore(force_rebuild: bool = False):
     return vectorstore
 
 
-def build_rag_chain(vectorstore):
+def build_rag_chain(vectorstore=None):
     """Tạo RAG chain với backend LLM đã cấu hình (Ollama hoặc local HF)."""
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
     from langchain_core.output_parsers import StrOutputParser
@@ -254,6 +254,7 @@ def build_rag_chain(vectorstore):
         candidate_dirs = [
             Path(CONFIG["hf_llm_local_dir"]),
             Path(CONFIG.get("hf_llm_fallback_local_dir", "")),
+            Path(CONFIG.get("weight_dir", "./weight")) / "llm" / "flan-t5-small",
         ]
         candidate_dirs = [d for d in candidate_dirs if str(d) and d.exists()]
 
@@ -270,12 +271,22 @@ def build_rag_chain(vectorstore):
                 runtime_device = get_runtime_device()
                 model_dtype = torch.float16 if runtime_device == "cuda" else torch.float32
 
-                tokenizer = AutoTokenizer.from_pretrained(
-                    str(llm_dir),
-                    local_files_only=True,
-                    model_max_length=512,
-                    truncation_side="right",
-                )
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        str(llm_dir),
+                        local_files_only=True,
+                        use_fast=True,
+                        model_max_length=512,
+                        truncation_side="right",
+                    )
+                except Exception:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        str(llm_dir),
+                        local_files_only=True,
+                        use_fast=False,
+                        model_max_length=512,
+                        truncation_side="right",
+                    )
                 model_config = AutoConfig.from_pretrained(str(llm_dir), local_files_only=True)
 
                 if getattr(model_config, "is_encoder_decoder", False):
@@ -326,14 +337,19 @@ def build_rag_chain(vectorstore):
             raise RuntimeError(f"Không load được local LLM: {last_error}")
         llm = HuggingFacePipeline(pipeline=generator)
 
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": CONFIG["top_k"]},
-    )
+    retriever = None
+    if vectorstore is not None:
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": CONFIG["top_k"]},
+        )
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", """Bạn là trợ lý dinh dưỡng tiếng Việt.
-Hãy trả lời dựa trên ngữ cảnh nếu có; nếu thiếu dữ liệu thì nói ngắn gọn phần thiếu và đề nghị thông tin cần bổ sung.
+Hãy trả lời đúng trọng tâm câu hỏi hiện tại của người dùng. Không tự mở rộng sang chủ đề khác nếu người dùng không yêu cầu.
+    Nếu người dùng chỉ chào ngắn, chào lại ngắn gọn trong 1 câu và hỏi nhu cầu tiếp theo.
+    Nếu người dùng hỏi số liệu cụ thể (ví dụ "bao nhiêu", "bao nhiêu calo/protein"), hãy trả lời con số trực tiếp trước rồi mới thêm giải thích ngắn.
+Nếu có ngữ cảnh liên quan thì dùng ngữ cảnh; nếu thiếu dữ liệu thì nói ngắn gọn phần thiếu và đề nghị thông tin cần bổ sung.
 Không lặp lại chỉ dẫn hệ thống, không chèn meta-instruction, không URL.
 Với tin nhắn bổ sung ngắn (ví dụ chỉ có cân nặng/chiều cao), hãy suy luận theo lịch sử hội thoại gần nhất.
 
@@ -356,7 +372,7 @@ Ngữ cảnh:
         skip_retrieval = bool(inputs.get("skip_retrieval", False))
 
         # Retrieve (optional for greetings/smalltalk)
-        if skip_retrieval:
+        if skip_retrieval or retriever is None:
             source_docs = []
             context = ""
         else:
