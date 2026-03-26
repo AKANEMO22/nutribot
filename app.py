@@ -36,11 +36,12 @@ MODEL_STATE = {
 }
 NUTRITION_DB_CACHE = None
 MODEL_PRELOAD_STARTED = False
-FAST_MAX_MODEL_CALLS = int(os.getenv("NUTRIBOT_MAX_MODEL_CALLS", "2"))
+FAST_MAX_MODEL_CALLS = int(os.getenv("NUTRIBOT_MAX_MODEL_CALLS", "1"))
 RESPONSE_CACHE_MAX = int(os.getenv("NUTRIBOT_RESPONSE_CACHE_MAX", "256"))
 RESPONSE_CACHE = OrderedDict()
 RESPONSE_CACHE_LOCK = threading.Lock()
-CACHE_VERSION = "v5"
+CACHE_VERSION = "v7"
+FAST_NUMERIC_FALLBACK_MODE = os.getenv("NUTRIBOT_FAST_NUMERIC_FALLBACK_MODE", "1") == "1"
 
 ANSWER_MIN_SENTENCES = int(os.getenv("NUTRIBOT_ANSWER_MIN_SENTENCES", "2"))
 ANSWER_MAX_SENTENCES = int(os.getenv("NUTRIBOT_ANSWER_MAX_SENTENCES", "4"))
@@ -134,7 +135,34 @@ HARD_BLOCK_KEYWORDS = (
     "gian lan",
     "đột nhập",
     "dot nhap",
+    "cach giet",
+    "cách giết",
+    "sat hai",
+    "sát hại",
+    "che tao bom",
+    "chế tạo bom",
+    "tao bom",
+    "chế bom",
 )
+
+REFUSAL_MARKERS = (
+    "không thể hỗ trợ",
+    "khong the ho tro",
+    "từ chối",
+    "tu choi",
+    "bị chặn",
+    "bi chan",
+    "can't assist",
+    "cannot assist",
+    "can't help",
+    "cannot help",
+    "sorry",
+)
+
+ENGLISH_COMMON_WORDS = {
+    "the", "and", "with", "for", "that", "this", "you", "your", "can", "cannot", "cant",
+    "sorry", "assist", "help", "please", "about", "from", "into", "should", "could", "today",
+}
 
 
 def is_greeting_like(text: str) -> bool:
@@ -174,12 +202,32 @@ def is_short_greeting(text: str) -> bool:
     return is_greeting_like(text)
 
 
+def has_weight_loss_goal(text: str) -> bool:
+    q = normalize_food_name(text)
+    if not q:
+        return False
+    if "giam mo" in q:
+        return True
+    return bool(re.search(r"\bgiam\s*(?:\d+\s*)?can\b", q))
+
+
+def relaxed_ascii_text(text: str) -> str:
+    raw = (text or "").lower()
+    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
 def has_nutrition_intent(text: str) -> bool:
     normalized = normalize_food_name(text)
-    return any(
+    base_intent = any(
         token in normalized
         for token in ("calo", "calories", "protein", "carb", "fat", "beo", "thuc don", "mon an", "giam can", "tang can")
     )
+    if base_intent or has_weight_loss_goal(text):
+        return True
+
+    relaxed = relaxed_ascii_text(text)
+    return any(token in relaxed for token in ("kcal", "calo", "protein", "thuc don", "an uong", "giam can"))
 
 
 def has_body_metric_signal(text: str) -> bool:
@@ -187,6 +235,48 @@ def has_body_metric_signal(text: str) -> bool:
     if not t:
         return False
     return bool(re.search(r"\b\d{2,3}\s*kg\b", t) or re.search(r"\b1[.,]\d{1,2}\s*m\b", t) or re.search(r"\bcm\b", t))
+
+
+def has_meal_plan_intent(question: str) -> bool:
+    q = normalize_food_name(question)
+    plan_markers = ("ke hoach", "lap ke hoach", "an uong", "thuc don")
+    time_markers = ("1 thang", "mot thang", "trong vong", "4 tuan")
+    has_goal = has_weight_loss_goal(question)
+    if q and any(m in q for m in plan_markers) and (has_goal or any(m in q for m in time_markers)):
+        return True
+
+    relaxed = relaxed_ascii_text(question)
+    return any(m in relaxed for m in plan_markers) and ("thang" in relaxed or "tuan" in relaxed or "giam" in relaxed)
+
+
+def needs_numeric_response(question: str) -> bool:
+    q = normalize_food_name(question)
+    if not q:
+        return False
+
+    numeric_markers = (
+        "bao nhieu",
+        "kcal",
+        "calo",
+        "protein",
+        "thuc don",
+        "chia protein",
+        "muc tieu",
+        "ke hoach an",
+        "lap ke hoach",
+    )
+    return any(marker in q for marker in numeric_markers) or has_meal_plan_intent(question)
+
+
+def has_numeric_signal(answer: str) -> bool:
+    text = (answer or "").strip().lower()
+    if not text:
+        return False
+    return bool(re.search(r"\d", text))
+
+
+def get_answer_max_len(question: str) -> int:
+    return 460 if has_meal_plan_intent(question) else 320
 
 
 def looks_low_quality_answer(question: str, answer: str) -> bool:
@@ -440,10 +530,8 @@ def is_explicitly_dangerous_query(text: str) -> bool:
 
 
 def extract_weight_from_text(text: str) -> Optional[float]:
-    t = normalize_food_name(text)
-    if not t:
-        return None
-    m = re.search(r"\b(\d{2,3})\s*kg\b", t)
+    q = normalize_food_name(text)
+    m = re.search(r"\b(\d{2,3})\s*kg\b", q)
     if not m:
         return None
     try:
@@ -452,135 +540,151 @@ def extract_weight_from_text(text: str) -> Optional[float]:
         return None
 
 
-def get_rule_based_nutrition_answer(text: str) -> Optional[str]:
+def extract_kcal_target_from_text(text: str) -> Optional[int]:
+    q = normalize_food_name(text)
+    for match in re.finditer(r"\b(\d{3,4})\b", q):
+        try:
+            value = int(match.group(1))
+        except Exception:
+            continue
+        if 1000 <= value <= 4000:
+            return value
+    return None
+
+
+def extract_target_loss_kg(text: str) -> Optional[float]:
     q = normalize_food_name(text)
     if not q:
         return None
 
-    if "uc ga" in q and ("protein" in q or "calo" in q or "kcal" in q):
+    # Examples: "giam 1 can", "giam 2kg", "giam 1.5 kg"
+    patterns = [
+        r"\bgiam\s*(\d+(?:[\.,]\d+)?)\s*can\b",
+        r"\bgiam\s*(\d+(?:[\.,]\d+)?)\s*kg\b",
+    ]
+    for p in patterns:
+        m = re.search(p, q)
+        if not m:
+            continue
+        try:
+            value = float(m.group(1).replace(",", "."))
+            if 0.2 <= value <= 20:
+                return value
+        except Exception:
+            continue
+    return None
+
+
+def build_numeric_nutrition_fallback(question: str) -> Optional[str]:
+    q = normalize_food_name(question)
+    if not q or not has_nutrition_intent(question):
+        return None
+
+    weight = extract_weight_from_text(question)
+    kcal_target = extract_kcal_target_from_text(question)
+    if kcal_target is None:
+        if weight:
+            kcal_target = max(1200, int(weight * 24 - 400))
+        else:
+            kcal_target = 1600
+
+    if weight:
+        protein_low = int(round(1.6 * weight))
+        protein_high = int(round(2.2 * weight))
+    else:
+        protein_low, protein_high = 90, 130
+
+    if has_meal_plan_intent(question):
+        target_loss = extract_target_loss_kg(question)
+        if target_loss is None:
+            target_loss = 1.0
+
+        weekly_loss = round(target_loss / 4.0, 2)
+        daily_deficit = int(round((target_loss * 7700) / 30.0))
+        daily_deficit = max(180, min(550, daily_deficit))
+
+        breakfast = int(round(kcal_target * 0.25))
+        lunch = int(round(kcal_target * 0.35))
+        snack = int(round(kcal_target * 0.10))
+        dinner = max(250, kcal_target - breakfast - lunch - snack)
         return (
-            "100g ức gà chín thường khoảng 165 kcal và 31g protein. "
-            "Nếu áp chảo nhiều dầu thì calo có thể tăng thêm 30-80 kcal tùy lượng dầu dùng."
+            f"Kế hoạch 1 tháng để giảm khoảng {target_loss:.1f}kg: đặt mức {kcal_target} kcal/ngày, "
+            f"protein {protein_low}-{protein_high}g/ngày, thâm hụt trung bình ~{daily_deficit} kcal/ngày "
+            f"(mục tiêu ~{weekly_loss:.2f}kg/tuần). "
+            f"Phân bổ mỗi ngày: sáng {breakfast} kcal, trưa {lunch} kcal, xế {snack} kcal, tối {dinner} kcal. "
+            "Tuần 1 theo đúng khung và cân 3 lần; tuần 2 tăng rau + giữ đạm; tuần 3 giảm đồ ngọt/chiên còn 1-2 bữa/tuần; "
+            "tuần 4 nếu cân đứng thì giảm thêm 100 kcal hoặc tăng 1500-2000 bước/ngày."
         )
 
-    if ("giam can" in q or "giam mo" in q) and ("1 thang" in q or "mot thang" in q):
+    if "thuc don" in q:
+        breakfast = int(round(kcal_target * 0.25))
+        lunch = int(round(kcal_target * 0.35))
+        snack = int(round(kcal_target * 0.10))
+        dinner = max(250, kcal_target - breakfast - lunch - snack)
         return (
-            "Kế hoạch giảm cân 1 tháng: tuần 1 đặt mục tiêu ăn ổn định và ngủ đủ, tuần 2-3 giữ thâm hụt 300-500 kcal/ngày, "
-            "tuần 4 đánh giá lại cân nặng/vòng eo để chỉnh khẩu phần. Mỗi ngày ưu tiên đạm nạc + rau + tinh bột vừa phải, "
-            "tập 3-4 buổi/tuần và đi bộ thêm 7-10 nghìn bước."
+            f"Gợi ý thực đơn khoảng {kcal_target} kcal/ngày cho người bận rộn: "
+            f"sáng {breakfast} kcal, trưa {lunch} kcal, xế {snack} kcal, tối {dinner} kcal. "
+            f"Mỗi bữa chính ưu tiên đạm nạc + rau; tổng protein nên ở mức {protein_low}-{protein_high}g/ngày để giữ cơ."
         )
 
-    if ("ke hoach" in q or "lap ke hoach" in q) and ("giam can" in q or "giam mo" in q):
-
+    if "protein" in q:
+        meals = 4 if "bua" in q else 3
+        per_meal_low = int(round(protein_low / meals))
+        per_meal_high = int(round(protein_high / meals))
         return (
-            "Kế hoạch giảm cân an toàn: đặt mức thâm hụt 300-500 kcal/ngày, ăn đủ đạm nạc và rau trong mỗi bữa, "
-            "hạn chế đồ ngọt/chiên, tập sức mạnh 3-4 buổi mỗi tuần và theo dõi cân nặng theo tuần để điều chỉnh khẩu phần."
-        )
-
-    if ("lap ke hoach an uong" in q) or ("lập kế hoạch ăn uống" in q):
-        return (
-            "Bạn có thể áp dụng khung ăn uống đơn giản: mỗi bữa gồm 1 phần đạm nạc, 1 phần rau lớn, 1 phần tinh bột vừa phải và chất béo tốt. "
-            "Đặt trước tổng kcal theo mục tiêu, chuẩn bị thực đơn 3 ngày xoay vòng và theo dõi cân nặng mỗi tuần để điều chỉnh."
-        )
-
-    if (("thuc don" in q) or ("goi y" in q and "1600" in q)) and ("1600" in q or "kcal" in q or "calo" in q):
-        return (
-            "Gợi ý 1600 kcal/ngày: sáng 400 kcal (yến mạch + trứng + trái cây), trưa 550 kcal "
-            "(cơm gạo lứt + ức gà/cá + rau), xế 150 kcal (sữa chua không đường + hạt), tối 500 kcal "
-            "(khoai + đạm nạc + salad). Ưu tiên đủ protein và rau để no lâu, hạn chế đồ chiên ngọt."
-        )
-
-    if ("pho bo" in q or "phở bò" in q) and ("dieu chinh" in q or "điều chỉnh" in q or "bua" in q or "bữa" in q):
-        return (
-            "Nếu tối ăn phở bò, các bữa còn lại nên giảm tinh bột và dầu mỡ: sáng ưu tiên trứng + sữa chua không đường + trái cây, "
-            "trưa ăn đạm nạc + nhiều rau + 1/2 chén cơm. Tổng ngày vẫn giữ đủ nước và protein để không bị đói về đêm."
-        )
-
-    if ("chia protein" in q) or ("giu co" in q) or ("giu co" in q):
-        w = extract_weight_from_text(text)
-        if w:
-            min_g = round(1.6 * w)
-            max_g = round(2.2 * w)
-            each_min = round(min_g / 4)
-            each_max = round(max_g / 4)
-            return (
-                f"Để giữ cơ khi giảm mỡ, bạn nên ăn khoảng {min_g}-{max_g}g protein/ngày "
-                f"(1.6-2.2g/kg). Chia 3-4 bữa, mỗi bữa khoảng {each_min}-{each_max}g protein "
-                "từ nguồn như ức gà, cá, trứng, sữa chua Hy Lạp, đậu hũ."
-            )
-        return (
-            "Để giữ cơ khi giảm mỡ, bạn nên ăn khoảng 1.6-2.2g protein/kg cân nặng mỗi ngày. "
-            "Chia 3-4 bữa, mỗi bữa 25-40g protein để tối ưu tổng hợp cơ và no lâu."
+            f"Bạn nên đặt tổng protein khoảng {protein_low}-{protein_high}g/ngày và chia {meals} bữa, "
+            f"mỗi bữa khoảng {per_meal_low}-{per_meal_high}g protein. "
+            "Ưu tiên ức gà, cá, trứng, sữa chua Hy Lạp, đậu hũ để giữ cơ khi giảm mỡ."
         )
 
     if ("truoc buoi tap" in q or "truoc tap" in q) and ("sau buoi tap" in q or "sau tap" in q):
         return (
-            "Trước tập 60-90 phút: ưu tiên carb dễ tiêu + ít đạm (chuối + sữa chua, bánh mì + trứng). "
-            "Sau tập trong 1-2 giờ: 25-35g protein + carb vừa phải (ức gà/cá + cơm/khoai) để phục hồi cơ và hỗ trợ giảm mỡ."
+            "Trước tập 60-90 phút: 30-50g carb dễ tiêu + 15-25g protein. "
+            "Sau tập trong 1-2 giờ: 25-35g protein + 40-70g carb để phục hồi cơ và hỗ trợ giảm mỡ."
         )
 
-    if ("bao nhieu kcal" in q or "bao nhieu calo" in q or "calo muc tieu" in q or "kcal" in q) and ("giam mo" in q or "giam can" in q):
-        w = extract_weight_from_text(text)
-        if w:
-            target = max(1200, round(w * 24 - 400))
-            low = max(1200, target - 100)
-            high = target + 100
-            return (
-                f"Với cân nặng khoảng {int(w)}kg, bạn có thể bắt đầu mức {low}-{high} kcal/ngày để giảm mỡ an toàn. "
-                "Theo dõi 2 tuần rồi điều chỉnh thêm 100-150 kcal theo tốc độ giảm cân thực tế."
-            )
-        return (
-            "Để giảm mỡ an toàn, bạn thường cần thâm hụt khoảng 300-500 kcal/ngày so với mức duy trì. "
-            "Bạn có thể bắt đầu quanh 1400-1900 kcal/ngày tùy cân nặng và mức vận động, rồi điều chỉnh theo kết quả sau 2 tuần."
-        )
-
-    return None
+    return (
+        f"Mục tiêu phù hợp để giảm mỡ an toàn là khoảng {kcal_target} kcal/ngày, "
+        f"kèm {protein_low}-{protein_high}g protein/ngày. Theo dõi 2 tuần rồi điều chỉnh thêm 100-150 kcal nếu cần."
+    )
 
 
-def extract_food_phrase_from_question(text: str) -> Optional[str]:
-    norm = normalize_food_name(text)
-    if not norm:
-        return None
-    m = re.search(r"\ban\s+([a-z0-9\s]{2,40}?)\s+nhieu\s+co\s+tot\s+khong\b", norm)
-    if not m:
-        return None
-    phrase = re.sub(r"\s+", " ", m.group(1)).strip()
-    return phrase or None
+def looks_refusal_answer(answer: str) -> bool:
+    lower = (answer or "").strip().lower()
+    if not lower:
+        return False
+    return any(marker in lower for marker in REFUSAL_MARKERS)
 
 
-def compose_intent_fallback_answer(question: str) -> Optional[str]:
-    q = normalize_food_name(question)
-    if not q:
-        return None
+def normalize_refusal_answer(answer: str) -> str:
+    if looks_refusal_answer(answer):
+        return "Mình không thể hỗ trợ yêu cầu này vì lý do an toàn. Nếu bạn muốn, mình có thể hỗ trợ nội dung dinh dưỡng an toàn hơn."
+    return (answer or "").strip()
 
-    if ("giam can" in q or "giam mo" in q) and ("1 thang" in q or "mot thang" in q):
-        return (
-            "Bạn có thể giảm cân 1 tháng theo 3 bước: giữ thâm hụt khoảng 300-500 kcal/ngày, "
-            "ưu tiên đạm nạc + rau trong mỗi bữa, và tập 3-4 buổi/tuần kết hợp đi bộ hằng ngày. "
-            "Theo dõi cân nặng theo tuần để điều chỉnh khẩu phần, tránh giảm quá nhanh."
-        )
 
-    if ("thuc don" in q or "thực đơn" in q) and ("1600" in q or "kcal" in q or "calo" in q):
-        return (
-            "Gợi ý thực đơn 1600 kcal: sáng khoảng 400 kcal (yến mạch + trứng + trái cây), trưa khoảng 550 kcal "
-            "(cơm + đạm nạc + rau), xế khoảng 150 kcal (sữa chua không đường + hạt), tối khoảng 500 kcal "
-            "(khoai/cơm vừa phải + cá/ức gà + salad)."
-        )
+def looks_mojibake_text(answer: str) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return False
 
-    if ("chia protein" in q) or (("protein" in q) and ("giu co" in q or "giữ cơ" in q)):
-        return (
-            "Để giữ cơ, bạn nên chia protein đều trong 3-4 bữa mỗi ngày, mỗi bữa khoảng 25-40g tùy cân nặng và mức tập luyện. "
-            "Ưu tiên nguồn đạm nạc như cá, ức gà, trứng, sữa chua Hy Lạp, đậu hũ."
-        )
+    markers = ("Ã", "á»", "â€", "Æ°", "Ä‘", "ï¸", "�")
+    return any(m in text for m in markers)
 
-    food_phrase = extract_food_phrase_from_question(question)
-    if food_phrase:
-        return (
-            f"Ăn {food_phrase} có lợi nếu khẩu phần hợp lý, nhưng không nên ăn quá nhiều trong thời gian dài. "
-            "Bạn nên đa dạng nguồn đạm, rau và tinh bột tốt để cân bằng dinh dưỡng; nếu có bệnh nền thì điều chỉnh theo tư vấn chuyên môn."
-        )
 
-    return None
+def is_english_dominant(answer: str) -> bool:
+    text = (answer or "").strip().lower()
+    if not text:
+        return False
+
+    words = re.findall(r"[a-z]+", text)
+    if len(words) < 6:
+        return False
+
+    english_hits = sum(1 for w in words if w in ENGLISH_COMMON_WORDS)
+    accented_hits = len(re.findall(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", text))
+
+    english_ratio = english_hits / max(1, len(words))
+    return english_ratio >= 0.18 and accented_hits == 0
 
 
 def looks_noisy_answer(question: str, answer: str) -> bool:
@@ -617,13 +721,30 @@ def is_focus_sufficient_answer(question: str, answer: str) -> bool:
     if not q or not a:
         return False
 
+    if needs_numeric_response(question) and not has_numeric_signal(answer):
+        return False
+
+    if has_meal_plan_intent(question):
+        structure_tokens = ("sang", "trua", "toi", "bua", "ngay", "tuan", "kcal", "calo", "protein")
+        hit_count = sum(1 for token in structure_tokens if token in a)
+        if hit_count < 3:
+            return False
+        if "tuan" not in a:
+            return False
+        if len((answer or "").split()) < 20:
+            return False
+
     if ("thuc don" in q) and ("1600" in q or "kcal" in q or "calo" in q):
         meal_tokens = ("sang", "trua", "toi", "bua")
         if not any(t in a for t in meal_tokens):
             return False
+        if "protein" not in a:
+            return False
 
     if ("chia protein" in q) or (("protein" in q) and ("giu co" in q)):
-        if not any(t in a for t in ("protein", "g", "moi bua", "bua")):
+        per_meal_marker = any(t in a for t in ("moi bua", "bua", "lan an"))
+        gram_marker = bool(re.search(r"\b\d+\s*g\b", a))
+        if not ("protein" in a and per_meal_marker and gram_marker):
             return False
 
     return True
@@ -931,6 +1052,15 @@ def run_local_chat_query(user_text: str) -> dict:
     if cached_answer:
         return {"ok": True, "answer": cached_answer, "source": "local_ai_cache"}
 
+    # Fast path for numeric nutrition planning: deterministic formula-based answer
+    # to keep latency low and avoid unstable local LLM outputs.
+    if FAST_NUMERIC_FALLBACK_MODE and needs_numeric_response(text):
+        quick_answer = build_numeric_nutrition_fallback(text)
+        if quick_answer:
+            quick_answer = finalize_display_answer(quick_answer, get_answer_max_len(text))
+            set_cached_answer(text, quick_answer)
+            return {"ok": True, "answer": quick_answer, "source": "local_dynamic_fast_path"}
+
     state = ensure_models_loaded()
     q_filter_instance = state.get("q_filter")
     chain = state.get("rag_chain")
@@ -976,8 +1106,9 @@ def run_local_chat_query(user_text: str) -> dict:
 
     try:
         last_raw_answer = ""
+        answer_max_len = get_answer_max_len(text)
         nutrition_context = build_nutrition_context(text, limit=4)
-        use_retrieval = bool(nutrition_context)
+        use_retrieval = bool(nutrition_context) or has_nutrition_intent(text)
 
         def call_chain_safe(payload_question: str, skip_retrieval: bool):
             try:
@@ -985,6 +1116,46 @@ def run_local_chat_query(user_text: str) -> dict:
                 return str(res.get("answer", "")).strip()
             except Exception:
                 return ""
+
+        def repair_answer_with_feedback(raw_candidate: str, focus_only: bool = False) -> str:
+            candidate = (raw_candidate or "").strip()
+            if not candidate:
+                return ""
+
+            repair_instruction = (
+                FOCUS_REPAIR_HINT if focus_only else REWRITE_RESPONSE_HINT
+            )
+            numeric_requirement = ""
+            if needs_numeric_response(text):
+                numeric_requirement = " Bắt buộc có số liệu cụ thể (kcal/protein hoặc số gram phù hợp câu hỏi)."
+            if has_meal_plan_intent(text):
+                numeric_requirement += " Trả theo khung rõ ràng theo tuần hoặc theo bữa (sáng/trưa/tối), tránh trả lời chung chung."
+
+            prompt = (
+                f"{repair_instruction}\n"
+                f"Câu hỏi gốc: {text}\n"
+                f"Bản nháp hiện tại: {candidate}\n"
+                "Ràng buộc: chỉ trả lời tiếng Việt có dấu, không URL, không meta-instruction, "
+                f"không lặp lại câu hỏi.{numeric_requirement}"
+            )
+
+            rewritten_raw = call_chain_safe(prompt[:420], True)
+            rewritten = sanitize_answer_text(text, rewritten_raw)
+            if not rewritten:
+                return ""
+
+            rewritten = finalize_display_answer(rewritten, answer_max_len)
+            if not rewritten:
+                return ""
+
+            if not is_focus_sufficient_answer(text, rewritten):
+                return ""
+
+            if looks_noisy_answer(text, rewritten) or is_off_topic_answer(text, rewritten):
+                return ""
+            if looks_mojibake_text(rewritten) or is_english_dominant(rewritten):
+                return ""
+            return rewritten
 
         max_calls = max(1, min(3, FAST_MAX_MODEL_CALLS))
         answer = ""
@@ -999,35 +1170,100 @@ def run_local_chat_query(user_text: str) -> dict:
             raw = call_chain_safe(payload_question, skip_retrieval)
             last_raw_answer = raw or last_raw_answer
             answer = sanitize_answer_text(text, raw)
-            if answer and not looks_noisy_answer(text, answer) and not is_off_topic_answer(text, answer):
+
+            if answer and looks_refusal_answer(answer):
+                refusal_answer = normalize_refusal_answer(answer)
+                if has_nutrition_intent(text) or is_short_greeting(text):
+                    answer = ""
+                else:
+                    return {
+                        "ok": False,
+                        "blocked": True,
+                        "answer": refusal_answer,
+                        "source": "local_ai",
+                    }
+
+            if answer and (looks_mojibake_text(answer) or is_english_dominant(answer)):
+                repaired = repair_answer_with_feedback(answer, focus_only=False)
+                answer = repaired or ""
+
+            if (
+                answer
+                and not looks_noisy_answer(text, answer)
+                and not is_off_topic_answer(text, answer)
+                and is_focus_sufficient_answer(text, answer)
+            ):
                 break
 
         if answer and is_off_topic_answer(text, answer):
             answer = ""
 
         if not answer:
-            intent_fallback = compose_intent_fallback_answer(text)
-            if intent_fallback:
-                intent_fallback = finalize_display_answer(intent_fallback, 320)
-                set_cached_answer(text, intent_fallback)
-                return {"ok": True, "answer": intent_fallback, "source": "local_fallback"}
-
             fallback_answer = sanitize_answer_text(text, last_raw_answer or "")
             if (
                 fallback_answer
                 and not looks_noisy_answer(text, fallback_answer)
                 and not is_off_topic_answer(text, fallback_answer)
                 and is_focus_sufficient_answer(text, fallback_answer)
+                and not looks_mojibake_text(fallback_answer)
+                and not is_english_dominant(fallback_answer)
             ):
-                fallback_answer = finalize_display_answer(fallback_answer, 320)
+                fallback_answer = finalize_display_answer(fallback_answer, answer_max_len)
                 set_cached_answer(text, fallback_answer)
                 return {"ok": True, "answer": fallback_answer, "source": "local_ai"}
 
+            repaired_fallback = repair_answer_with_feedback(last_raw_answer or "", focus_only=True)
+            if repaired_fallback:
+                set_cached_answer(text, repaired_fallback)
+                return {"ok": True, "answer": repaired_fallback, "source": "local_ai_repair"}
+
+            if has_meal_plan_intent(text):
+                dynamic_fallback = build_numeric_nutrition_fallback(text)
+                if dynamic_fallback:
+                    dynamic_fallback = finalize_display_answer(dynamic_fallback, answer_max_len)
+                    set_cached_answer(text, dynamic_fallback)
+                    return {"ok": True, "answer": dynamic_fallback, "source": "local_dynamic_fallback"}
+
+            if needs_numeric_response(text):
+                plan_requirement = ""
+                if has_meal_plan_intent(text):
+                    plan_requirement = " Bắt buộc nêu kế hoạch theo tuần hoặc theo bữa (sáng/trưa/tối)."
+                strict_prompt = (
+                    "Trả lời trực tiếp câu hỏi dinh dưỡng sau bằng tiếng Việt có dấu. "
+                    "Bắt buộc có số liệu cụ thể phù hợp (kcal/protein hoặc số gram), "
+                    f"không hỏi lại người dùng, không URL, không meta-instruction.{plan_requirement} "
+                    f"Câu hỏi: {text}"
+                )
+                strict_raw = call_chain_safe(strict_prompt[:420], True)
+                strict_answer = sanitize_answer_text(text, strict_raw)
+                if (
+                    strict_answer
+                    and not looks_noisy_answer(text, strict_answer)
+                    and not is_off_topic_answer(text, strict_answer)
+                    and is_focus_sufficient_answer(text, strict_answer)
+                    and not looks_mojibake_text(strict_answer)
+                    and not is_english_dominant(strict_answer)
+                ):
+                    strict_answer = finalize_display_answer(strict_answer, answer_max_len)
+                    set_cached_answer(text, strict_answer)
+                    return {"ok": True, "answer": strict_answer, "source": "local_ai_strict_retry"}
+
             loose_answer = sanitize_answer_text_loose(last_raw_answer or "")
-            if loose_answer:
+            if (
+                loose_answer
+                and not looks_mojibake_text(loose_answer)
+                and not is_english_dominant(loose_answer)
+                and is_focus_sufficient_answer(text, loose_answer)
+            ):
                 loose_answer = finalize_display_answer(loose_answer, 280)
                 set_cached_answer(text, loose_answer)
                 return {"ok": True, "answer": loose_answer, "source": "local_ai"}
+
+            dynamic_fallback = build_numeric_nutrition_fallback(text)
+            if dynamic_fallback:
+                dynamic_fallback = finalize_display_answer(dynamic_fallback, answer_max_len)
+                set_cached_answer(text, dynamic_fallback)
+                return {"ok": True, "answer": dynamic_fallback, "source": "local_dynamic_fallback"}
 
             return {
                 "ok": False,
@@ -1036,11 +1272,38 @@ def run_local_chat_query(user_text: str) -> dict:
             }
 
         if not is_focus_sufficient_answer(text, answer):
-            intent_fallback = compose_intent_fallback_answer(text)
-            if intent_fallback:
-                answer = intent_fallback
+            repaired_focus = repair_answer_with_feedback(answer, focus_only=True)
+            if repaired_focus:
+                answer = repaired_focus
 
-        answer = finalize_display_answer(answer, 320)
+        if answer and not is_focus_sufficient_answer(text, answer):
+            dynamic_fallback = build_numeric_nutrition_fallback(text) if needs_numeric_response(text) else None
+            if dynamic_fallback:
+                dynamic_fallback = finalize_display_answer(dynamic_fallback, answer_max_len)
+                set_cached_answer(text, dynamic_fallback)
+                return {"ok": True, "answer": dynamic_fallback, "source": "local_dynamic_fallback"}
+            answer = ""
+
+        if answer and (looks_mojibake_text(answer) or is_english_dominant(answer)):
+            repaired = repair_answer_with_feedback(answer, focus_only=False)
+            answer = repaired or ""
+
+        if answer and looks_refusal_answer(answer):
+            return {
+                "ok": False,
+                "blocked": True,
+                "answer": normalize_refusal_answer(answer),
+                "source": "local_ai",
+            }
+
+        if not answer:
+            return {
+                "ok": False,
+                "answer": "AI local đã xử lý nhưng chưa tạo được câu trả lời tiếng Việt đủ rõ. Bạn thử nêu câu hỏi cụ thể hơn nhé.",
+                "source": "local_ai",
+            }
+
+        answer = finalize_display_answer(answer, answer_max_len)
         set_cached_answer(text, answer)
         return {"ok": True, "answer": answer, "source": "local_ai"}
     except Exception as exc:

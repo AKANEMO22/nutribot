@@ -385,8 +385,8 @@ Ngữ cảnh:
         else:
             recent_history = chat_history[-4:]
 
-        if len(question) > 220:
-            question = question[:220]
+        if len(question) > 420:
+            question = question[:420]
 
         # Generate
         response = (prompt | llm | StrOutputParser()).invoke({
@@ -396,8 +396,8 @@ Ngữ cảnh:
         })
 
         # Cập nhật history (truncate to avoid future context bloat)
-        chat_history.append(HumanMessage(content=question[:220]))
-        chat_history.append(AIMessage(content=str(response)[:140]))
+        chat_history.append(HumanMessage(content=question[:320]))
+        chat_history.append(AIMessage(content=str(response)[:220]))
 
         return {"answer": response, "source_documents": source_docs}
 
