@@ -1,7 +1,9 @@
 {
-  "created_at": 1774350668,
-  "rounds": 2,
-  "max_cycles": 2,
+  "created_at": 1774485932,
+  "rounds": 1,
+  "max_cycles": 3,
+  "until_stable": true,
+  "hard_cap": 6,
   "stable": true,
   "cycles": [
     {
@@ -12,70 +14,70 @@
         "blocked_rate": 0.0,
         "timeout_like_rate": 0.0,
         "low_quality_rate": 0.0,
-        "latency_avg_sec": 27.959,
-        "latency_p95_sec": 50.546,
+        "latency_avg_sec": 43.342,
+        "latency_p95_sec": 101.784,
         "hi_is_stable": true,
         "stable": true
       },
       "records": [
         {
-          "prompt": "hi",
+          "prompt": "Xin chào",
           "ok": true,
           "blocked": false,
           "timeout_like": false,
           "low_quality": false,
-          "latency_sec": 50.172,
-          "answer_preview": "Chao ban! Toi la NutriBot, ban muon minh ho tro calories hay thuc don hom nay?",
+          "latency_sec": 0.001,
+          "answer_preview": "Xin chào bạn. Mình có thể hỗ trợ bạn về calo, thực đơn và kế hoạch giảm mỡ.",
           "cycle": 1
         },
         {
-          "prompt": "lap ke hoach giam can trong 1 thang",
+          "prompt": "Mình cao 1m68 nặng 72kg, hãy gợi ý mục tiêu calo mỗi ngày để giảm mỡ an toàn.",
           "ok": true,
           "blocked": false,
           "timeout_like": false,
           "low_quality": false,
-          "latency_sec": 16.773,
-          "answer_preview": "g\n- banh mi thu: 250 kcal, protein 10.0g, carbs 20.0g, fat 10.0g\n- banh mi ket thuc: 300 kcal, protein 15.0g, carbs 25.0g, fat 10.0g\n- banh mi ket thuc: 350 kcal, protein 20.0g, ca",
+          "latency_sec": 59.313,
+          "answer_preview": "kích thước cơ thể để xác định mức độ béo phì hoặc thừa cân của mình. Sau đó, bạn có thể tính toán lượng calo cần giảm để đạt được mục tiêu giảm mỡ. Tuy nhiên, việc giảm cân một các",
           "cycle": 1
         },
         {
-          "prompt": "100g uc ga co bao nhieu protein",
+          "prompt": "100g ức gà luộc có bao nhiêu calo và protein?",
           "ok": true,
           "blocked": false,
           "timeout_like": false,
           "low_quality": false,
-          "latency_sec": 17.004,
-          "answer_preview": "Trả lời ngắn gọn, rõ ràng và chính xác. Ưu tiên dùng tiếng Việt nếu câu hỏi bằng tiếng Việt. Nếu không có giá trị trả lời bằng tiếng Việt, hãy trả lời bằng tiếng Anh.\n\nCâu hỏi: \nDự",
+          "latency_sec": 30.881,
+          "answer_preview": "Bạn có thể tham khảo các quy tắc sau: - Đối với người lớn khỏe mạnh, một chế độ ăn uống cân bằng thường cung cấp khoảng 2,000 - 2,400 calo/ngày. - Đối với người cao tuổi hoặc người",
           "cycle": 1
         },
         {
-          "prompt": "hi",
+          "prompt": "Gợi ý thực đơn 1 ngày khoảng 1600 kcal, ưu tiên món dễ nấu.",
           "ok": true,
           "blocked": false,
           "timeout_like": false,
           "low_quality": false,
-          "latency_sec": 49.597,
-          "answer_preview": "Chao ban! Toi la NutriBot, ban muon minh ho tro calories hay thuc don hom nay?",
+          "latency_sec": 58.103,
+          "answer_preview": "tạo ra một thực đơn phù hợp với khẩu phần này, bạn có thể chọn các món như: - 1 quả trứng gà xé nhỏ - 1 miếng ức gà luộc - 1 lòng đỏ trứng gà - 1 củ cà rốt luộc - 1 trái chuối - 1 ",
           "cycle": 1
         },
         {
-          "prompt": "lap ke hoach giam can trong 1 thang",
+          "prompt": "Nếu tối nay mình ăn phở bò thì cần điều chỉnh các bữa còn lại như thế nào?",
           "ok": true,
           "blocked": false,
           "timeout_like": false,
           "low_quality": false,
-          "latency_sec": 17.113,
-          "answer_preview": "g\n- banh mi thu: 260 kcal, protein 10.0g, carbs 20.0g, fat 10.0g\n- banh mi nhat: 300 kcal, protein 15.0g, carbs 25.0g, fat 15.0g\n\nDuyet: 1 thang sau khi ăn banh mi thu, banh mi tru",
+          "latency_sec": 85.053,
+          "answer_preview": "êu ý khác: Nếu tối nay bạn ăn phở bò, bạn có thể giảm lượng thức ăn hoặc nước uống tương ứng với khẩu phần ăn này. Tuy nhiên, điều quan trọng là đảm bảo cơ thể vẫn được cung cấp đủ",
           "cycle": 1
         },
         {
-          "prompt": "100g uc ga co bao nhieu protein",
+          "prompt": "Mình nên chia protein theo từng bữa ra sao để giữ cơ khi giảm cân?",
           "ok": true,
           "blocked": false,
           "timeout_like": false,
           "low_quality": false,
-          "latency_sec": 17.096,
-          "answer_preview": "Nguyễn: 100g uc ga co bao nhieu protein? \nTổng số lượng protein trong diem này là 35.0g. \nDựa vào liệu pháp dinh dưỡng, lượng protein cần thiết là 75% hoặc ít hơn. \nVì vậy, lượng p",
+          "latency_sec": 26.702,
+          "answer_preview": "ĩệt. Lưu ý rằng việc tăng cường vận động cũng rất quan trọng để hỗ trợ quá trình giảm cân.",
           "cycle": 1
         }
       ]

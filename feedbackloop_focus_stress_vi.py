@@ -35,20 +35,10 @@ def _prepare_streamlit_stub() -> None:
 _prepare_streamlit_stub()
 
 import app
+from chatbot_prompt_sets import load_prompt_set
 
 
-FOCUS_PROMPTS = [
-    "tư vấn calo ngày hôm nay cho tôi",
-    "tu van calo ngay hom nay cho toi",
-    "Hôm nay tôi nên ăn bao nhiêu calo để giảm mỡ?",
-    "Mức calo hôm nay cho người mới giảm cân là bao nhiêu?",
-    "Cho tôi tư vấn calo trong ngày hôm nay",
-    "Calo mục tiêu hôm nay của tôi là bao nhiêu?",
-    "Hôm nay nên nạp bao nhiêu kcal thì hợp lý?",
-    "Bạn gợi ý tổng calo trong ngày hôm nay cho tôi nhé",
-    "Tính calo hôm nay giúp tôi",
-    "Gợi ý lượng calo hôm nay để giảm cân",
-]
+FOCUS_PROMPTS = load_prompt_set("focus_calorie")
 
 PROMPT_LEAK_MARKERS = [
     "h\u00e3y tr\u1ea3 l\u1eddi",

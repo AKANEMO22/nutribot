@@ -35,14 +35,10 @@ def _prepare_streamlit_stub() -> None:
 _prepare_streamlit_stub()
 
 import app
+from chatbot_prompt_sets import load_prompt_set
 
 
-VI_PROMPTS = [
-    "Xin chao",
-    "Vach ke hoach giam can trong vong 1 thang cho nguoi moi bat dau.",
-    "Goi y thuc don giam mo trong 1 ngay cho nguoi 75kg.",
-    "100g uc ga co bao nhieu protein va calo?",
-]
+VI_PROMPTS = load_prompt_set("fast_vi")
 
 
 def to_seconds(value: float) -> float:

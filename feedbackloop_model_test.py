@@ -5,13 +5,10 @@ import time
 from pathlib import Path
 
 import app
+from chatbot_prompt_sets import load_prompt_set
 
 
-DEFAULT_PROMPTS = [
-    "hi",
-    "lap ke hoach giam can trong 1 thang",
-    "100g uc ga co bao nhieu protein",
-]
+DEFAULT_PROMPTS = load_prompt_set("basic_vi")
 
 TIMEOUT_LIKE_MARKERS = [
     "phan hoi cham",
@@ -23,6 +20,12 @@ TIMEOUT_LIKE_MARKERS = [
 
 def normalize_text(text: str) -> str:
     return (text or "").strip().lower()
+
+
+def is_greeting_prompt(text: str) -> bool:
+    t = normalize_text(text)
+    markers = ("hi", "hello", "hey", "xin chao", "xin chào", "chao", "chào")
+    return any(t == m or t.startswith(m + " ") for m in markers)
 
 
 def is_timeout_like(answer: str) -> bool:
@@ -45,7 +48,7 @@ def is_low_quality(question: str, answer: str) -> bool:
         if short_ratio > 0.55:
             return True
 
-    if normalize_text(question) == "hi" and len(a) > 180:
+    if is_greeting_prompt(question) and len(a) > 180:
         return True
 
     return False
@@ -83,11 +86,11 @@ def summarize(records: list[dict]) -> dict:
     timeout_like_count = sum(1 for r in records if r["timeout_like"])
     low_quality_count = sum(1 for r in records if r.get("low_quality"))
 
-    hi_records = [r for r in records if normalize_text(r["prompt"]) == "hi"]
+    hi_records = [r for r in records if is_greeting_prompt(r["prompt"])]
     hi_ok = all(
         r["ok"] and not r["blocked"] and not r["timeout_like"] and not r.get("low_quality")
         for r in hi_records
-    ) if hi_records else False
+    ) if hi_records else True
 
     p95 = statistics.quantiles(latencies, n=100)[94] if len(latencies) >= 2 else latencies[0]
 
@@ -116,6 +119,12 @@ def main():
     parser = argparse.ArgumentParser(description="Feedback loop test for local AI model path")
     parser.add_argument("--rounds", type=int, default=3, help="How many rounds over prompt set")
     parser.add_argument("--max-cycles", type=int, default=3, help="Repeat cycle until stable or max cycles")
+    parser.add_argument(
+        "--until-stable",
+        action="store_true",
+        help="Keep cycling until stable; uses --hard-cap to avoid infinite loops",
+    )
+    parser.add_argument("--hard-cap", type=int, default=20, help="Safety cap when --until-stable is enabled")
     parser.add_argument("--sleep", type=float, default=0.1, help="Sleep between requests (sec)")
     args = parser.parse_args()
 
@@ -127,7 +136,11 @@ def main():
     all_cycles = []
     stable = False
 
-    for cycle in range(1, args.max_cycles + 1):
+    total_cycles = max(1, args.max_cycles)
+    if args.until_stable:
+        total_cycles = max(total_cycles, max(1, args.hard_cap))
+
+    for cycle in range(1, total_cycles + 1):
         records = []
         for _ in range(args.rounds):
             for prompt in DEFAULT_PROMPTS:
@@ -149,10 +162,15 @@ def main():
             stable = True
             break
 
+        if (not args.until_stable) and cycle >= args.max_cycles:
+            break
+
     report = {
         "created_at": int(time.time()),
         "rounds": args.rounds,
         "max_cycles": args.max_cycles,
+        "until_stable": bool(args.until_stable),
+        "hard_cap": args.hard_cap,
         "stable": stable,
         "cycles": all_cycles,
     }
